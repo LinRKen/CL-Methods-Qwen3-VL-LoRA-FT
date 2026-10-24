@@ -26,12 +26,25 @@ VIDEOCHATGPT = {
     "data_path": "PATH_TO_VIDEOCHATGPT_DATA",
 }
 
+COSINE_ROOT = "/home/linruikang/data/datasets/COSINE"
+COSINE_TASKS = ("geo", "hypo", "motion", "nav", "pattern", "view", "whole")
+COSINE_SPLITS = ("train", "test")
+COSINE_DATASETS = {
+    f"cosine_{task}_{split}": {
+        "annotation_path": f"{COSINE_ROOT}/{task}/{split}.json",
+        "data_path": "",
+    }
+    for task in COSINE_TASKS
+    for split in COSINE_SPLITS
+}
+
 data_dict = {
     "cambrian_737k": CAMBRIAN_737K,
     "cambrian_737k_pack": CAMBRIAN_737K_PACK,
     "mp_doc": MP_DOC,
     "clevr_mc": CLEVR_MC,
     "videochatgpt": VIDEOCHATGPT,
+    **COSINE_DATASETS,
 }
 
 
