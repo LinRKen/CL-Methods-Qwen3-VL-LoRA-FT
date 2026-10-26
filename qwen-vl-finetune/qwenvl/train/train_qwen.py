@@ -17,13 +17,22 @@
 import os
 import logging
 import pathlib
-import torch
-import transformers
 import sys
 from pathlib import Path
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
+
+from qwenvl.train.wandb_utils import (
+    configure_wandb_gpu_monitoring,
+    prepare_training_gpu_selection,
+)
+
+# Resolve GPU identities before torch/Transformers can initialize CUDA.
+_training_gpu_selection = prepare_training_gpu_selection()
+
+import torch
+import transformers
 
 from trainer import replace_qwen2_vl_attention_class
 
@@ -98,6 +107,7 @@ def train(attn_implementation="flash_attention_2"):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
+    configure_wandb_gpu_monitoring(training_args, _training_gpu_selection)
     os.makedirs(training_args.output_dir, exist_ok=True)
 
     if "qwen3" in model_args.model_name_or_path.lower() and "a" in Path(model_args.model_name_or_path.rstrip("/")).name.lower():
