@@ -1,6 +1,6 @@
 # Smoke 测试
 
-本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。当前已准备目录结构及外部数据、结果访问入口，尚未新增或运行任何测试。
+本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。已新增 COSINE Qwen 4B 评测测试；流程验证通过，语义判分存在未通过项，详见下方报告。
 
 ## 目录结构
 
@@ -44,7 +44,7 @@ smoke/
 
 ## 添加与运行测试
 
-目前尚无 smoke 脚本、测试配置或可执行的测试命令。后续每项测试应说明：
+现有脚本与复现命令见下节。每项测试应说明：
 
 1. 验证目标及通过条件。
 2. 所需环境、依赖和输入；固定样本记录来源、样本 ID 及预期输出。
@@ -52,6 +52,37 @@ smoke/
 4. 外部结果保存位置及对应的验证报告。
 
 训练环境路径为 `/home/linruikang/data/envs/Qwen3VL-LoRA-FT`；需要其他环境时，在相应测试说明和报告中记录实际使用的环境。创建本目录不代表环境或功能验证通过。
+
+## COSINE Qwen 4B 评测验证
+
+2026-10-26 已在 test/eval-qwen 验证：CPU 30 项通过，motion 691 条及断点续跑通过；固定语义用例仅 22/30 完整符合预期，存在误判，不能视作判分可靠性验收通过。详情见 [验证报告](reports/EVAL_QWEN_4B_20261026.md)。
+
+| 文件 | 用途 |
+| --- | --- |
+| scripts/test_eval_qwen.py | CPU 行为与异常分支检查 |
+| fixtures/eval_qwen_cases.json | 30 条运行前固定的人工用例和预期 |
+| configs/eval_qwen_4b.json | 4B、物理 GPU 1 与已有 motion 输入配置 |
+| scripts/run_eval_qwen_fixtures.py | 使用生产函数验证人工用例 |
+| scripts/interrupt_eval_qwen.py | 内存包装生产函数，在 64 条完整写入后主动中断 |
+| scripts/run_eval_qwen_integration.py | 中断、正式入口续跑、完整结果无 GPU 重建和产物检查 |
+| scripts/eval_qwen_audit/sitecustomize.py | 记录 worker 最早期的设备限制，只在测试配置下启用 |
+
+在 885 的仓库根目录复现（会重新启动 GPU 评测；结果写新的外部目录）：
+
+```bash
+cd /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT
+EVAL_PY=/home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+RUN_ROOT=$(mktemp -d /home/linruikang/data/smoke/CL/CL-Methods/Qwen3-VL/LoRA-FT/results/eval-qwen-4b-XXXXXXXX)
+export CUDA_VISIBLE_DEVICES=GPU-63a25b73-5c01-919f-188a-29c116904574
+export CUDA_DEVICE_ORDER=PCI_BUS_ID VLLM_WORKER_MULTIPROC_METHOD=spawn
+export PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD/qwen-vl-finetune"
+export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 TOKENIZERS_PARALLELISM=false
+CUDA_VISIBLE_DEVICES='' "$EVAL_PY" smoke/scripts/test_eval_qwen.py --report "$RUN_ROOT/cpu.json"
+"$EVAL_PY" smoke/scripts/run_eval_qwen_fixtures.py --output-dir "$RUN_ROOT/fixtures"
+"$EVAL_PY" smoke/scripts/run_eval_qwen_integration.py --output-dir "$RUN_ROOT/motion"
+```
+
+三个命令分别运行；固定用例脚本退出 2 表示实际语义结果未全部符合预期，不应据此修改预期用例。集成脚本内部的主动中断退出 75 为预期，最终集成脚本成功退出 0。每个输出子目录必须不存在，避免覆盖既有证据。需已有配置指定的本地权重、motion 推理结果和 COSINE 测试集，不下载依赖或数据。CPU 测试无需 GPU；GPU 脚本显式固定为物理 GPU 1。
 
 ## 验证报告
 

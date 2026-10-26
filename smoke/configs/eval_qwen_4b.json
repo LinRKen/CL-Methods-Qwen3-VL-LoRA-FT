@@ -1,0 +1,15 @@
+{
+  "judge_model": "/home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct",
+  "physical_gpu": 1,
+  "gpu_uuid": "GPU-63a25b73-5c01-919f-188a-29c116904574",
+  "batch_size": 4,
+  "tensor_parallel_size": 1,
+  "gpu_memory_utilization": 0.8,
+  "max_model_len": 8192,
+  "max_new_tokens": 256,
+  "repair_attempts": 1,
+  "seed": 42,
+  "dtype": "bfloat16",
+  "dataset": "cosine_motion_test",
+  "input_file": "/home/linruikang/data/infer-results/motion-final-lora-20261026.ozbi042d/motion.predictions.jsonl"
+}
