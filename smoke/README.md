@@ -1,6 +1,6 @@
 # Smoke 测试
 
-本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。当前已准备目录结构及外部数据、结果访问入口，尚未新增或运行任何测试。
+本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。当前包含 W&B GPU 监控的 CPU 检查和短时单卡/双卡训练验证，详见 [验证报告](reports/wandb-gpu-monitoring-test-20261026.md)。
 
 ## 目录结构
 
@@ -44,7 +44,15 @@ smoke/
 
 ## 添加与运行测试
 
-目前尚无 smoke 脚本、测试配置或可执行的测试命令。后续每项测试应说明：
+当前脚本：
+
+- scripts/test_wandb_gpu_monitoring.py：CPU 安全、SDK 配置解析和生产入口调用顺序检查，物理 0 用例全部 mock。
+- scripts/run_wandb_gpu_monitoring.py：显式 --devices 指定物理 GPU 1–3 子集，验证实际 GPU 指标和 run 归属；--check-only 只复核已有证据。
+- scripts/wandb_gpu_trainer_smoke.py：内部 worker，复用生产 helper、Trainer 和 WandbCallback。
+
+测试采用 W&B offline 模式；结果、缓存、短相对 TMPDIR 均保存在被忽略的 results 树。运行命令和限制见上述报告。
+
+后续每项测试应说明：
 
 1. 验证目标及通过条件。
 2. 所需环境、依赖和输入；固定样本记录来源、样本 ID 及预期输出。
