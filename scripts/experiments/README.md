@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 的执行器，以及 Multitask、Singletask、CL 的高级 tune 编排。Transfer tune 编排、infer、eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 的执行器，以及 Multitask、Singletask、CL、Transfer-round1 和 Transfer-round2 的高级 tune 编排。infer、eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -12,8 +12,8 @@
 - `lib/common.py`：ID、时间、JSON、指纹、原子写入和记录锁。
 - `lib/tune_executor.py`：校验冻结 tune job、限定设备并执行一次训练，保存日志和运行证据、登记 adapter 与完整 checkpoint。
 - `run_tune_job.py`：单 job 命令行入口；不调度同一高级 run 的其他 job。
-- `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 tune jobs 或 CL 的串行训练链，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
-- `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。只执行训练阶段。
+- `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 jobs、CL 串行链和 Transfer 两轮分支，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
+- `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。支持 Multitask、Singletask、CL 和两种 Transfer setting，只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
 - `requirements.txt`：配置层的 PyYAML 依赖，不替代各模型环境的依赖。
 
@@ -134,7 +134,7 @@ base、processor 和 annotation manifest 按冻结的 input_specs 自动生成�
   --experiment-id singletask-example
 ~~~
 
-`--default`、`--set` 的含义与 `pipeline.py prepare` 一致；未指定值沿用默认 YAML。已有 experiment ID 不覆盖，重新实验使用新 ID。入口在创建记录前拒绝 Zero-shot、Transfer 及未启用 tune 的配置。infer/eval 即使已登记，也只保持 planned。
+`--default`、`--set` 的含义与 `pipeline.py prepare` 一致；未指定值沿用默认 YAML。已有 experiment ID 不覆盖，重新实验使用新 ID。入口在创建记录前拒绝 Zero-shot 及未启用 tune 的配置。infer/eval 即使已登记，也只保持 planned。
 
 已使用 prepare 建好记录，或先手动完成了其中若干低级 job 时，可指定其高级 tune run 目录：
 
@@ -150,13 +150,41 @@ base、processor 和 annotation manifest 按冻结的 input_specs 自动生成�
 - 高级 run 的 `tune.run.max_parallel_jobs` 限制并发低级进程数；`tune.run.fail_fast` 决定失败策略。这两个调度参数以高级 run 的冻结值为准，job 局部覆盖不改变整个 run 的策略。
 - 每个 job 使用自身合并后的 `tune.params`，以及 `tune.run.python`、`gpu_groups`、`master_addr`、`master_port` 和 W&B 设置；高级 CLI 覆盖继续按原配置优先级生效。
 - 调度器从各 job 的有效 `gpu_groups` 选择空闲组，按物理 GPU 集与 `master_addr`/`master_port + group_index` 避免本 run 内的资源冲突；低级执行器继续持有 GPU、端口和阶段槽位锁。job 局部 GPU 分组不同时也按实际设备处理。物理 GPU 0 始终禁止，训练与 W&B 使用同一分组。
-- `max_parallel_jobs: 1` 或只有一组 GPU 时依次训练。Multitask/Singletask 的独立任务配置多组独立 GPU 并提高并发上限后可并行；CL 的任务依赖仍强制六阶段串行。单组可含多张 GPU，由低级执行器使用 torchrun。
-- `fail_fast: true` 在发现首个失败后停止派发，并请求其他活动低级进程退出、等待其关闭训练进程及登记已完整写出的 checkpoint；未启动任务标为 cancelled。`false` 继续其他独立任务，最后仍将有失败的高级 run 标为 failed；CL 后续阶段依赖前一阶段，即使关闭 fail_fast，依赖失败或 adapter 审计失败后也会取消后续阶段。如果低级进程已经退出而 job 仍为 running，或其执行收据记录清理失败，调度器停止整个 run，保留失败证据供检查残留训练进程，不继续复用该设备。
+- `max_parallel_jobs: 1` 或只有一组 GPU 时依次训练。独立任务或 Transfer 分支配置多组独立 GPU 并提高并发上限后可并行；CL 的任务依赖仍强制六阶段串行。单组可含多张 GPU，由低级执行器使用 torchrun。
+- `fail_fast: true` 在发现首个失败后停止派发，并请求其他活动低级进程退出、等待其关闭训练进程及登记已完整写出的 checkpoint；未启动任务标为 cancelled。`false` 继续其他独立任务，最后仍将有失败的高级 run 标为 failed；CL 后续阶段依赖前一阶段，Transfer 第二轮依赖各自的第一轮来源，即使关闭 fail_fast，依赖失败或 adapter 审计失败后也会取消受影响的后续任务。如果低级进程已经退出而 job 仍为 running，或其执行收据记录清理失败，调度器停止整个 run，保留失败证据供检查残留训练进程，不继续复用该设备。
 - SIGINT/SIGTERM 同样停止派发、请求低级清理并等待退出，保留已有成功产物与证据，整体记为 cancelled。高级层不强杀仍在清理或保存 checkpoint 的低级进程。
 
 每次高级调用在 run 记录树内新建 `orchestrations/<invocation-id>/`，保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`；低级详细训练日志仍位于原 payload 的 `logs/train.log`。run 根目录的 `tune-summary.json` 保存最新汇总，列出 job_order/task_order、每个 job 的状态、退出码、GPU/端口分配、日志、输出目录及 adapter manifest 路径/指纹/producer/slot，并记录 depends_on、lineage、training_state_policy、是否显式恢复、父 adapter 的 manifest/指纹/producer 和依赖阻断原因。若 adapter 内容或来源复核失败，高级 run 不记录成功，即使该 job 先前已是 succeeded。
 
-所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。Transfer 调度、infer/eval 自动运行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
+所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。infer/eval 自动运行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
+
+## Transfer 两轮迁移高级 tune
+
+Transfer-round1 和 Transfer-round2 使用相同的训练结构：第一轮在 motion、hypo、pattern、nav、view、geo 上分别从 base model 新建 LoRA，共六个独立 job；第二轮将每个第一轮 adapter 分别迁移到另外五个 task，共三十个独立 job。每个高级 tune run 合计 36 个低级训练 job。
+
+- 第一轮 job：`tune-round1-<task>`，输出 slot 为 `round1-<task>`。
+- 第二轮 job：`tune-round2-<source>-to-<target>`，其中 source 与 target 不同，训练 target/train，输出 slot 为 `round2-<source>-to-<target>`。
+- 第二轮只依赖同一高级 run 的 `tune-round1-<source>`。同一 source 的五个子 job 都从该第一轮 final adapter 独立开始，不串联彼此的训练结果。
+
+第二轮继续训练父 LoRA 参数，重新初始化 optimizer、scheduler、epoch 和 global step；不将 LoRA 合并到 base，不额外叠加 adapter，也不沿用父训练状态。只有显式的同 task checkpoint 恢复才使用完整训练状态，继续沿用低级入口的恢复规则。
+
+高级入口核对冻结计划的全部 36 个 job、排队顺序、task、依赖、requires、lineage、输出 slot 及模型/数据输入。第二轮启动前须等待其第一轮低级进程退出、job 成功且 final adapter 审计通过，再自动绑定该父 job 的绝对 manifest 路径。已有绑定必须与登记的父产物完全一致，不能换成其他 source、第二轮兄弟 job、其他 run 或最新 checkpoint。第一轮和第二轮的成功产物均核对轮次 lineage、训练状态策略与继承输入指纹。
+
+队列先列全部第一轮 job，再按 source/target 列第二轮 job；资源满足时按队列选择已就绪的任务。第二轮只等待自身父 job，不要求其他来源的第一轮全部结束。并发数、job 局部 GPU 分组、端口冲突、资源锁和中断清理均使用既有高级调度机制。父 job 失败或 adapter 审计失败时，其五个第二轮 job 会被阻断；`fail_fast: false` 可继续其余独立来源分支，`true` 则停止整个 run 的派发并清理活动进程。
+
+以下是使用示例，本轮未执行：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_tune.py --config scripts/experiments/configs/transfer_round1.yaml --experiment-id transfer-round1-example
+
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_tune.py --config scripts/experiments/configs/transfer_round2.yaml --experiment-id transfer-round2-example
+~~~
+
+通过 `--run-dir` 接管已有 planned/running 高级 run 时，已成功的第二轮 job 必须具有成功且通过复核的第一轮父 job 和精确父绑定；不同来源分支可以具有不同的完成进度。其余 job 状态、拒绝重复执行与显式恢复规则沿用前述高级入口，不自动重置终态或创建 retry。
+
+36 个 final adapter 分别保存在 `<checkpoints_root>/<experiment_id>/<run_id>/<job_id>/adapter/`，第一轮六个 adapter 保留供所有子 job 读取，子 job 不覆盖父产物。`tune-summary.json` 记录每个 job 的轮次、source/train task、父 adapter、状态、资源、输出和阻断原因；全部 36 个 job 成功且产物核对通过后，高级 tune run 才记为 succeeded。
+
+两个 setting 的区别在后续测试选择：Transfer-round1 将三十个第二轮 adapter 分别测试其第一轮 source task；Transfer-round2 测试其第二轮 target task。现有计划已保留该区别，本入口只执行 tune，infer/eval 仍保持 planned。默认 YAML 与 setting YAML 的参数核对留待最终阶段。
 
 ## CL 持续学习高级 tune
 
