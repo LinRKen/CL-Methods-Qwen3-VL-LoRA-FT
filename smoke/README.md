@@ -90,3 +90,9 @@ CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwe
 未经用户明确授权，禁止使用 885 的物理 GPU 0；适用于训练、推理、评测及 GPU 诊断或测试。
 
 所有 GPU 进程启动前，必须显式限制到物理 GPU 1–3 中所需的子集，按物理编号及 UUID 核实设备，并确认启动器和子进程继承限制。禁止默认使用全部 GPU 或回退到物理 GPU 0。进程内逻辑 `cuda:0` 可以对应获准的物理 GPU，不能仅凭逻辑编号判断。
+
+## 低级 LoRA 训练执行器验证
+
+2026-10-27 验证通过：CPU 28 项通过；物理 GPU 1 上新建 LoRA、跨任务 adapter 继承和完整 checkpoint 恢复均成功。恢复后的 adapter 与未中断训练逐张量一致；范围审计确认 smoke 外的仓库状态未变。详情、命令和限制见 [执行器验证报告](reports/TUNE_EXECUTOR_20261027.md)。
+
+验证代码为 `scripts/test_tune_executor.py` 和 `scripts/run_tune_executor_gpu.py`。CPU 入口屏蔽 GPU 并使用合成产物；GPU 入口固定物理 GPU 1，会实际训练三个短 job。两者都要求预先创建全新的 smoke/results 子目录。GPU 入口的 `--verify-only` 仅审计已有训练产物，不重新训练。
