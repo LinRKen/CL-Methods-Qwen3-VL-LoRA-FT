@@ -1,6 +1,6 @@
 # Smoke 测试
 
-本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。已完成 pipeline 第一阶段的 CPU 验证；77 项中 74 项通过、3 项失败，详见 [验证报告](reports/PIPELINE_FOUNDATION_20261027.md)。
+本目录用于管理快速验证训练、推理及辅助功能的测试代码、配置、少量固定样本和验证报告。已完成 pipeline 冻结计划修复的 CPU 验证；原有 77 项与新增 26 项共 103 项全部通过，详见 [修复验证报告](reports/PIPELINE_PLAN_FIX_20261027.md)。此前三项失败及原始证据保留在 [第一阶段报告](reports/PIPELINE_FOUNDATION_20261027.md)。
 
 ## 目录结构
 
@@ -52,7 +52,17 @@ mkdir -p "$run_dir"
 bash smoke/scripts/run_pipeline_foundation.sh "$run_dir"
 ```
 
-该验证不使用 GPU，不加载真实模型或数据；已有 cases/ 或 tests.json 的结果目录会被拒绝。当前被测版本有三项已记录失败，详见报告。
+该验证不使用 GPU，不加载真实模型或数据；已有 cases/ 或 tests.json 的结果目录会被拒绝。修复后的版本原有 77 项全部通过。此前失败结果保留在第一阶段报告中。
+
+冻结计划边界验证使用独立的新目录：
+
+```bash
+constraint_dir="smoke/results/pipeline-plan-constraints-$(date +%Y%m%d-%H%M%S)"
+mkdir -p "$constraint_dir"
+CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python -B   smoke/scripts/test_pipeline_plan_constraints.py --result-dir "$constraint_dir"
+```
+
+该入口只运行新增的 26 项测试，复用第一阶段的合成 fixture 和模型导入限制；与原有 77 项合计 103 项。已存在的测试结果不会被覆盖。
 
 后续每项测试应说明：
 
