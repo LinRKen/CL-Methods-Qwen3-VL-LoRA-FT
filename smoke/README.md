@@ -96,3 +96,9 @@ CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwe
 2026-10-27 验证通过：CPU 28 项通过；物理 GPU 1 上新建 LoRA、跨任务 adapter 继承和完整 checkpoint 恢复均成功。恢复后的 adapter 与未中断训练逐张量一致；范围审计确认 smoke 外的仓库状态未变。详情、命令和限制见 [执行器验证报告](reports/TUNE_EXECUTOR_20261027.md)。
 
 验证代码为 `scripts/test_tune_executor.py` 和 `scripts/run_tune_executor_gpu.py`。CPU 入口屏蔽 GPU 并使用合成产物；GPU 入口固定物理 GPU 1，会实际训练三个短 job。两者都要求预先创建全新的 smoke/results 子目录。GPU 入口的 `--verify-only` 仅审计已有训练产物，不重新训练。
+
+## Multitask 与 Singletask 高级 tune 编排验证
+
+2026-10-27 验证通过：CPU 27 项全部通过；物理 GPU 1 上实际运行 Multitask 的一个 whole job 与 Singletask 的六个独立 task jobs，七项均成功。每 job 使用 4 条真实样本、2 optimizer steps，初始 LoRA 一致、最终权重更新；134 项产物/退出审计通过；范围审计记录了一项 index 字节差异，额外核验确认暂存文件内容保持不变。命令、配置与边界见 [编排验证报告](reports/TUNE_ORCHESTRATOR_20261027.md)。
+
+验证代码为 `scripts/test_tune_orchestrator.py` 和 `scripts/run_tune_orchestrator_gpu.py`。CPU 入口屏蔽 GPU 并替换训练 worker；GPU 入口调用真实高级 CLI，固定物理 GPU 1 串行训练全部七个 job。均要求预先创建全新 smoke/results 子目录，并显式传入 `--result-dir`。GPU 入口的 `--verify-only` 只在 CPU 审计已有产物，不重新训练；本轮已完成，不重复启动。
