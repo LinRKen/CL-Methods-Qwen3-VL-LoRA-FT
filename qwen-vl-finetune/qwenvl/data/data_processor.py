@@ -247,8 +247,23 @@ class LazySupervisedDataset(Dataset):
     def __init__(self, processor, data_args):
         super(LazySupervisedDataset, self).__init__()
 
-        dataset = data_args.dataset_use.split(",")
-        dataset_list = data_list(dataset)
+        annotation_path = getattr(data_args, "annotation_path", None)
+        media_root = getattr(data_args, "media_root", None)
+        if annotation_path is not None:
+            if data_args.dataset_use:
+                raise ValueError("annotation_path and dataset_use are mutually exclusive")
+            annotation = Path(annotation_path)
+            if not annotation.is_absolute() or not annotation.is_file():
+                raise ValueError("annotation_path must identify an existing absolute file")
+            if media_root is None or not Path(media_root).is_absolute() or not Path(media_root).is_dir():
+                raise ValueError("Explicit annotation input requires an existing absolute media_root")
+            dataset_list = [{"annotation_path": str(annotation), "data_path": media_root,
+                             "sampling_rate": 1.0}]
+        else:
+            if media_root is not None:
+                raise ValueError("media_root is used only with annotation_path")
+            dataset = data_args.dataset_use.split(",")
+            dataset_list = data_list(dataset)
         rank0_print(f"Loading datasets: {dataset_list}")
         self.video_max_total_pixels = getattr(
             data_args, "video_max_total_pixels", 1664 * 28 * 28
