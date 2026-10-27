@@ -1,0 +1,4 @@
+# Inherits configs/default.yaml; specify only setting-specific differences.
+experiment:
+  name: singletask
+  setting: singletask
