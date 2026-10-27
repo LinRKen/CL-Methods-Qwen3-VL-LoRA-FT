@@ -241,14 +241,33 @@ def create_stage_run(experiment_dir, stage, cli_override=None, run_id=None, stag
     return directory
 
 
+def _load_planned_jobs(directory, record):
+    """Read the frozen plan and index its jobs, if this run has a plan."""
+    if record["plan"] is None:
+        return None
+    if record["plan"] != "plan.json":
+        raise ValueError("Stage-run plan fingerprint mismatch")
+    plan = read_json(Path(directory) / "plan.json")
+    if fingerprint(plan) != record["plan_fingerprint"]:
+        raise ValueError("Stage-run plan fingerprint mismatch")
+    if not isinstance(plan, dict) or not isinstance(plan.get("jobs"), list):
+        raise ValueError("Stage-run plan must contain a jobs list")
+    planned_jobs = {}
+    for job in plan["jobs"]:
+        if not isinstance(job, dict):
+            raise ValueError("Every planned job must be an object")
+        identifier = require_id(job.get("job_id"))
+        if identifier in planned_jobs:
+            raise ValueError("Duplicate job ID in frozen plan: {}".format(identifier))
+        planned_jobs[identifier] = job
+    return planned_jobs
+
+
 def load_stage_run(directory):
     directory = Path(directory).expanduser().resolve(strict=True)
     _, record = _read_record(directory, "run.json")
     snapshot = _load_snapshot(directory, record)
-    if record["plan"] is not None:
-        if (record["plan"] != "plan.json"
-                or fingerprint(read_json(directory / "plan.json")) != record["plan_fingerprint"]):
-            raise ValueError("Stage-run plan fingerprint mismatch")
+    _load_planned_jobs(directory, record)
     return record, snapshot
 
 
@@ -296,6 +315,20 @@ def create_job(stage_run_dir, job_id, *, job_override=None, cli_override=None, i
             raise ValueError("Cannot add a job to a terminal stage run")
         if any(item["job_id"] == identifier for item in parent["jobs"]):
             raise ValueError("Job is already registered: {}".format(identifier))
+        planned_jobs = _load_planned_jobs(stage_run_dir, parent)
+        if planned_jobs is not None:
+            if identifier not in planned_jobs:
+                raise ValueError("Job is not in the frozen stage-run plan: {}".format(identifier))
+            planned = planned_jobs[identifier]
+            defaults = {"task": None, "tasks": None, "depends_on": [], "requires": [],
+                        "input_specs": [], "lineage": {}, "output": None}
+            fields = {"task": task, "tasks": tasks, "depends_on": depends_on, "requires": requires,
+                      "input_specs": input_specs, "lineage": lineage, "output": output}
+            mismatched = [name for name, value in fields.items()
+                          if value != planned.get(name, defaults[name])]
+            if mismatched:
+                raise ValueError("Job {} differs from the frozen plan in fields: {}".format(
+                    identifier, ", ".join(mismatched)))
         if set(depends_on) - {item["job_id"] for item in parent["jobs"]}:
             raise ValueError("Local job dependencies must already exist in this stage run")
         directory.mkdir(exist_ok=False)
@@ -423,11 +456,25 @@ def update_status(directory, new_status, message=None):
                         raise ValueError("Every planned test task requires its own prediction artifact")
             elif record["kind"] in ("stage_run", "experiment"):
                 children = record["jobs"] if record["kind"] == "stage_run" else record["stage_runs"]
+                planned_jobs = _load_planned_jobs(directory, record) if record["kind"] == "stage_run" else None
+                if planned_jobs is not None:
+                    registered_ids = [child["job_id"] for child in children]
+                    if len(set(registered_ids)) != len(registered_ids):
+                        raise ValueError("Stage run contains duplicate registered job IDs")
+                    missing = set(planned_jobs) - set(registered_ids)
+                    unexpected = set(registered_ids) - set(planned_jobs)
+                    if missing or unexpected:
+                        raise ValueError("Stage-run jobs do not match the frozen plan (missing: {}; unexpected: {})".format(
+                            ", ".join(sorted(missing)) or "none",
+                            ", ".join(sorted(unexpected)) or "none"))
                 if not children:
                     raise ValueError("Cannot succeed with no child records")
                 for child in children:
                     child_dir = directory / child["path"] if record["kind"] == "stage_run" else directory / "stage-runs" / child["stage"] / child["run_id"]
                     child_record = record_status(child_dir)
+                    if planned_jobs is not None and (child_record["kind"] != "job"
+                            or child_record["job_id"] != child["job_id"]):
+                        raise ValueError("Registered job record does not match its job ID: {}".format(child["job_id"]))
                     if child_record["status"] != "succeeded":
                         raise ValueError("All child records must succeed first")
         filename = {"experiment": "experiment.json", "stage_run": "run.json", "job": "job.json"}[record["kind"]]
