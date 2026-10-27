@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录和产物清单。当前阶段不包含 tune、infer、eval 执行后端或资源调度。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单，以及一个同步执行单个低级 LoRA tune job 的执行器。高级 run 调度、infer、eval 执行后端仍未实现。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -10,6 +10,8 @@
 - `lib/records.py`：experiment → 高级 stage run → 低级 job 的记录、依赖和状态接口。
 - `lib/artifacts.py`：外部输入及运行产物的来源、精确路径和内容清单。
 - `lib/common.py`：ID、时间、JSON、指纹、原子写入和记录锁。
+- `lib/tune_executor.py`：校验冻结 tune job、限定设备并执行一次训练，保存日志和运行证据、登记 adapter 与完整 checkpoint。
+- `run_tune_job.py`：单 job 命令行入口；不调度同一高级 run 的其他 job。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
 - `requirements.txt`：配置层的 PyYAML 依赖，不替代各模型环境的依赖。
 
@@ -93,5 +95,24 @@ python scripts/experiments/pipeline.py plan --config scripts/experiments/configs
 python scripts/experiments/pipeline.py prepare --config scripts/experiments/configs/cl_mhpnvg.yaml --experiment-id cl-mhpnvg-example
 ~~~
 
-plan 只打印 JSON 计划；prepare 创建记录但不执行模型。可使用 --default 指定其他默认 YAML，使用 --set infer.params.batch_size=2 等点号参数临时覆盖。真实运行入口、权重加载与续训、模型执行及恢复调度在后续阶段接入。
+plan 只打印 JSON 计划；prepare 创建记录但不执行模型。可使用 --default 指定其他默认 YAML，使用 --set infer.params.batch_size=2 等点号参数临时覆盖。run_tune_job.py 接受准备好的 job 目录和冻结 gpu_groups 的零起始索引。例如：
+
+~~~bash
+python scripts/experiments/run_tune_job.py --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion --gpu-group-index 0
+~~~
+
+未绑定内部依赖时，从成功 producer job 的 adapter manifest 显式传入，参数格式为 `--input <role>=<绝对 manifest 路径>`。例如：
+
+~~~bash
+python scripts/experiments/run_tune_job.py \
+  --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-02-hypo \
+  --gpu-group-index 0 \
+  --input parent-motion=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion/artifacts/adapter.json
+~~~
+
+恢复同一训练任务的中断状态时，给新的 planned job 显式传入失败/取消 attempt 已登记的 `artifacts/checkpoint-<step>.json`，并加 `--resume-training-state`。如果冻结计划还要求父 adapter，也要按其 adapter manifest 一并传入；checkpoint 提供模型权重和训练状态，父 adapter 用于验证 lineage。恢复要求训练 task、有效 job 配置、数据/模型输入指纹、父 adapter payload、DeepSpeed 配置和 GPU world size 与原 attempt 一致。不会搜索 latest checkpoint，也不会覆盖失败 attempt 的输出。终态 job 不能重新启动；低级入口不会重启终态 job，也不自动生成 retry 记录；恢复所需的新 planned job 记录由后续编排层负责创建。
+
+base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，W&B 监控只筛选同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
+
+每个低级输出目录包含 `checkpoints/`（训练 checkpoint 与 training_result.json）、`adapter/`（最终可复用 LoRA adapter 和 processor）、`logs/`（训练日志及 W&B 文件）及执行收据 `execution.json`。完成后 adapter、完整训练 checkpoint 和 summary manifest 会登记到 job 的 artifacts/；失败或中断时，执行器会尝试保留已完整写入的 checkpoint manifest，作为显式恢复来源。低级执行器只将父高级 run 推进为 running，完成/失败的汇总由后续高级调度器处理。一次命令只运行一个 job；高级 run 的批量调度、infer、eval 和最终 YAML 核对留待后续阶段。
 
