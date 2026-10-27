@@ -84,6 +84,17 @@ CUDA_VISIBLE_DEVICES='' "$EVAL_PY" smoke/scripts/test_eval_qwen.py --report "$RU
 
 三个命令分别运行；固定用例脚本退出 2 表示实际语义结果未全部符合预期，不应据此修改预期用例。集成脚本内部的主动中断退出 75 为预期，最终集成脚本成功退出 0。每个输出子目录必须不存在，避免覆盖既有证据。需已有配置指定的本地权重、motion 推理结果和 COSINE 测试集，不下载依赖或数据。CPU 测试无需 GPU；GPU 脚本显式固定为物理 GPU 1。
 
+## COSINE Qwen 8B 重评
+
+配置位于 configs/eval_qwen_8b.json，沿用同一组人工用例及原 motion checkpoint-543 预测，只更换 judge 权重。两个 runner 均支持 --config，默认仍读取 4B 配置。复现时按上面的环境设置，建立新的 RUN_ROOT，然后顺序运行：
+
+~~~bash
+"$EVAL_PY" smoke/scripts/run_eval_qwen_fixtures.py --config smoke/configs/eval_qwen_8b.json --output-dir "$RUN_ROOT/fixtures"
+"$EVAL_PY" smoke/scripts/run_eval_qwen_integration.py --config smoke/configs/eval_qwen_8b.json --output-dir "$RUN_ROOT/motion"
+~~~
+
+本次 8B 用例完整符合预期 26/30、最终分数符合预期 30/30，仍有状态及数值抽取偏差。motion 为 159/691（23.01%），invalid 从 4B 的 527 降到 5，逐条最终分数不变。详情见 reports/EVAL_QWEN_8B_20261026.md。此结果不能解释为语义验收全部通过。
+
 ## 验证报告
 
 在 `reports/` 中按测试主题保存简洁报告，至少记录：

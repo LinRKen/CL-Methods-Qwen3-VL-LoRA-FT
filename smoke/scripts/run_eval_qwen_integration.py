@@ -16,9 +16,9 @@ from dataset_utils import read_jsonl
 
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--output-dir',required=True); opts=parser.parse_args()
+    parser=argparse.ArgumentParser(); parser.add_argument('--output-dir',required=True); parser.add_argument('--config',type=Path,default=ROOT/'smoke/configs/eval_qwen_4b.json'); opts=parser.parse_args()
     output=Path(opts.output_dir); output.mkdir(parents=True,exist_ok=False)
-    config=json.loads((ROOT/'smoke/configs/eval_qwen_4b.json').read_text())
+    config=json.loads(opts.config.resolve().read_text())
     env=os.environ.copy()
     env.update(CUDA_VISIBLE_DEVICES=config['gpu_uuid'],CUDA_DEVICE_ORDER='PCI_BUS_ID',
                VLLM_WORKER_MULTIPROC_METHOD='spawn',PYTHONDONTWRITEBYTECODE='1',HF_HUB_OFFLINE='1',
@@ -28,6 +28,8 @@ def main():
     env['PATH']=str(Path(sys.executable).parent)+os.pathsep+env.get('PATH','')
     model_args=['--dataset',config['dataset'],'--input-file',config['input_file'],
                 '--output-dir',str(output),'--judge-model',config['judge_model']]
+    for key in ('batch_size','tensor_parallel_size','gpu_memory_utilization','max_model_len','max_new_tokens','repair_attempts','seed','dtype'):
+        model_args.extend(['--'+key.replace('_','-'),str(config[key])])
     observations=[]
     def run_phase(name,command,expected,phase_env):
         started=time.monotonic()

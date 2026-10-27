@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run 30 predeclared semantic judge cases using production functions and 4B only."""
+"""Run 30 predeclared semantic judge cases using production functions and a selected local judge."""
 import argparse
 import json
 import os
@@ -15,8 +15,8 @@ from qwen_judge import build_messages, scored_record
 
 
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument('--output-dir',required=True); opts=parser.parse_args()
-    config=json.loads((ROOT/'smoke/configs/eval_qwen_4b.json').read_text())
+    parser=argparse.ArgumentParser(); parser.add_argument('--output-dir',required=True); parser.add_argument('--config',type=Path,default=ROOT/'smoke/configs/eval_qwen_4b.json'); opts=parser.parse_args()
+    config=json.loads(opts.config.resolve().read_text())
     os.environ['CUDA_VISIBLE_DEVICES']=config['gpu_uuid']
     args=SimpleNamespace(**{key:config[key] for key in ['batch_size','tensor_parallel_size','gpu_memory_utilization','max_model_len','max_new_tokens','repair_attempts','seed','dtype']})
     args.dataset='smoke_handwritten_30'
@@ -52,7 +52,7 @@ def main():
     summary={'total':len(cases),'passed':sum(row['passed'] for row in comparisons),
              'parse_failures':sum(row['judge_parse_error'] is not None for row in scored),
              'repairs':sum(len(row['attempts'])>1 for row in done.values()),'prompt_tokens_min':min(lengths),
-             'prompt_tokens_max':max(lengths),'devices':devices,'run':run,'cases':comparisons}
+             'prompt_tokens_max':max(lengths),'devices':devices,'config':str(opts.config.resolve()),'run':run,'cases':comparisons}
     write_json_atomic(output/'judge.scored.jsonl',scored,jsonl=True)
     write_json_atomic(output/'fixture.metrics.json',summary)
     print(json.dumps(summary,ensure_ascii=False),flush=True)
