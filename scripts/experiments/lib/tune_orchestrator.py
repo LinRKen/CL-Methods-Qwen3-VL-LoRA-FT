@@ -1,4 +1,4 @@
-"""Run one frozen Multitask or Singletask tune stage over its low-level jobs."""
+"""Run one frozen Multitask, Singletask or CL tune stage over its low-level jobs."""
 
 from contextlib import contextmanager
 import fcntl
@@ -14,15 +14,15 @@ from .config import resolve_job_config
 from .records import (
     load_experiment, load_job, load_stage_run, record_status, update_status,
 )
-from .tune_executor import FRESH, RESTORE, _context as _tune_job_context
+from .tune_executor import CONTINUE, FRESH, RESTORE, _context as _tune_job_context
 
-SUPPORTED_SETTINGS = ("multitask", "singletask")
+SUPPORTED_SETTINGS = ("multitask", "singletask", "cl")
 
 
 def require_supported_setting(snapshot):
     experiment = snapshot["config"]["experiment"]
     if experiment["setting"] not in SUPPORTED_SETTINGS:
-        raise ValueError("High-level tune currently supports only multitask and singletask")
+        raise ValueError("High-level tune currently supports only multitask, singletask and cl")
     if "tune" not in experiment["enabled_stages"]:
         raise ValueError("The experiment must enable the tune stage")
 
@@ -59,6 +59,12 @@ def _context(run_dir):
         expected = {"tune-whole": "whole"}
     elif setting == "singletask":
         expected = {"tune-{}".format(task): task for task in TASKS}
+    else:
+        order = config["experiment"]["task_order"]
+        if len(order) != len(TASKS) or set(order) != set(TASKS):
+            raise ValueError("CL requires each of the six tasks exactly once")
+        expected = {"tune-{:02d}-{}".format(index, task): task
+                    for index, task in enumerate(order, 1)}
     planned = plan.get("jobs")
     if not isinstance(planned, list) or {item.get("job_id") for item in planned} != set(expected):
         raise ValueError("Tune plan has unexpected or missing low-level jobs")
@@ -66,14 +72,28 @@ def _context(run_dir):
         raise ValueError("Tune plan contains duplicate jobs")
     if {item["job_id"]: item.get("task") for item in planned} != expected:
         raise ValueError("Tune plan task assignment does not match its setting")
+    if setting == "cl" and [item["job_id"] for item in planned] != list(expected):
+        raise ValueError("CL plan order differs from the frozen task_order")
     by_id = {item["job_id"]: item for item in planned}
-    for job_id, planned_job in by_id.items():
-        if (planned_job.get("depends_on") or planned_job.get("requires")
-                or planned_job.get("lineage") != {
-                    "train_task": expected[job_id], "initialization": "base_model",
-                    "training_state": "fresh_optimizer_scheduler_epoch_global_step"}
-                or planned_job.get("output") != {"artifact_kind": "adapter", "slot": expected[job_id]}):
-            raise ValueError("{} must be an independent fresh-base-model training job".format(job_id))
+    previous = None
+    for job_id, task in expected.items():
+        planned_job = by_id[job_id]
+        depends_on, requires = [], []
+        lineage = {"train_task": task, "initialization": "base_model",
+                   "training_state": "fresh_optimizer_scheduler_epoch_global_step"}
+        if setting == "cl":
+            lineage["parent_job"] = previous
+            if previous is not None:
+                depends_on = [previous]
+                requires = [{"stage": "tune", "job_id": previous, "artifact_kind": "adapter",
+                             "slot": expected[previous]}]
+                lineage["initialization"] = "previous_adapter_weights"
+        if (planned_job.get("depends_on", []) != depends_on
+                or planned_job.get("requires", []) != requires
+                or planned_job.get("lineage") != lineage
+                or planned_job.get("output") != {"artifact_kind": "adapter", "slot": task}):
+            raise ValueError("{} has an invalid training dependency or lineage".format(job_id))
+        previous = job_id
         annotation = [item for item in planned_job.get("input_specs", [])
                       if item.get("kind") == "annotation"]
         if (len(annotation) != 1 or annotation[0].get("metadata") !=
@@ -122,9 +142,7 @@ def _context(run_dir):
         if any(job["output_spec" if name == "output" else name] != by_id[job_id].get(name, default)
                for name, default in defaults.items()):
             raise ValueError("Job differs from the frozen tune plan: " + job_id)
-        if (any(item["kind"] == "adapter" for item in job["inputs"].values())
-                or job["training_state_policy"] not in (FRESH, RESTORE)):
-            raise ValueError("Independent tune jobs cannot inherit another task's adapter: " + job_id)
+        _training_policy(job)
         expected_output = (Path(config["experiment"]["checkpoints_root"])
                            / experiment_id / run["run_id"] / job_id)
         if Path(job["output_dir"]) != expected_output:
@@ -133,10 +151,14 @@ def _context(run_dir):
             raise ValueError("Job {} is {}; do not relaunch active or terminal attempts".format(
                 job_id, job["status"]))
         info = {"directory": directory, "task": task, "snapshot": job_snapshot,
-                "initial_status": job["status"]}
+                "depends_on": list(job["depends_on"]), "initial_status": job["status"]}
         if job["status"] == "planned":
-            # Use the same record/lineage checks as the single-job executor.
-            _tune_job_context(directory)
+            if job["artifacts"]:
+                raise ValueError("An unexecuted planned job cannot have outputs: " + job_id)
+            # Later CL stages are not ready yet. Repeat the low-level checks
+            # immediately before launch, after the parent executor has exited.
+            if not job["depends_on"]:
+                _tune_job_context(directory)
             if ((directory / "execution.json").exists() or Path(job["output_dir"]).exists()
                     or Path(job["output_dir"]).is_symlink()):
                 raise ValueError("Job {} already has execution evidence or an output; review it explicitly".format(job_id))
@@ -155,7 +177,71 @@ def _context(run_dir):
         else:
             info["adapter"] = _successful_adapter(directory, job)
         jobs[job_id] = info
+    for job_id, info in jobs.items():
+        job, _ = load_job(info["directory"])
+        if not info["depends_on"]:
+            continue
+        if info["initial_status"] == "succeeded":
+            if any(jobs[parent]["initial_status"] != "succeeded" for parent in info["depends_on"]):
+                raise ValueError("Succeeded CL stages must form a continuous prefix: " + job_id)
+            info["parent_adapter"] = _parent_adapter(job, jobs, require_bound=True)
+        elif job["inputs"]:
+            # A manually bound job must still use this run's exact parent.
+            info["parent_adapter"] = _parent_adapter(job, jobs, require_bound=True)
     return run_dir, run, snapshot, setting, jobs
+
+
+def _training_policy(job):
+    """Distinguish cross-task weight inheritance from explicitly bound recovery."""
+    adapters = [item for item in job["inputs"].values() if item["kind"] == "adapter"]
+    checkpoints = [item for item in job["inputs"].values() if item["kind"] == "checkpoint"]
+    chained = bool(job["depends_on"])
+    resume = job["resume_training_state"]
+    if not chained and adapters:
+        raise ValueError("Independent tune jobs cannot inherit another task's adapter: " + job["job_id"])
+    if chained and job["inputs"] and len(adapters) != 1:
+        raise ValueError("A bound CL stage must contain exactly one parent adapter: " + job["job_id"])
+    if type(resume) is not bool or len(checkpoints) > 1 or bool(checkpoints) != resume:
+        raise ValueError("Training-state recovery requires one explicitly bound checkpoint: " + job["job_id"])
+    policy = RESTORE if resume else CONTINUE if chained else FRESH
+    if job["training_state_policy"] != policy:
+        raise ValueError("Training-state policy disagrees with the frozen dependency: " + job["job_id"])
+
+
+def _parent_adapter(job, jobs, *, require_bound=False):
+    """Resolve only the audited final adapter from the preceding frozen CL job."""
+    parent_id, = job["depends_on"]
+    parent_info = jobs[parent_id]
+    if "adapter" not in parent_info:
+        raise ValueError("Parent adapter has not passed its output audit: " + parent_id)
+    parent_job, _ = load_job(parent_info["directory"])
+    parent = _successful_adapter(parent_info["directory"], parent_job)
+    if parent != parent_info["adapter"]:
+        raise ValueError("Parent adapter registration changed after its output audit: " + parent_id)
+    role = "parent-" + parent_info["task"]
+    if job["inputs"] or require_bound:
+        adapters = [(key, item) for key, item in job["inputs"].items() if item["kind"] == "adapter"]
+        if len(adapters) != 1:
+            raise ValueError("CL stage lacks its exact bound parent adapter: " + job["job_id"])
+        role, manifest = adapters[0]
+        check_manifest(manifest)
+        if manifest != read_json(parent["manifest"]):
+            raise ValueError("Bound adapter differs from the preceding stage's registered output: " + job["job_id"])
+    return {**parent, "input_role": role}
+
+
+def _prepare_launch(info, jobs):
+    job, snapshot, _, _ = _tune_job_context(info["directory"])
+    if (snapshot["snapshot_fingerprint"] != info["snapshot"]["snapshot_fingerprint"]
+            or job["depends_on"] != info["depends_on"]):
+        raise ValueError("Frozen job changed while waiting for its dependencies")
+    _training_policy(job)
+    info["input_manifests"] = {}
+    if info["depends_on"]:
+        parent = _parent_adapter(job, jobs)
+        info["parent_adapter"] = parent
+        if not job["inputs"]:
+            info["input_manifests"][parent["input_role"]] = parent["manifest"]
 
 
 def _successful_adapter(job_dir, job):
@@ -177,6 +263,17 @@ def _successful_adapter(job_dir, job):
             or manifest["metadata"].get("training_task") != job["task"]
             or manifest["metadata"].get("config_fingerprint") != job["config_fingerprint"]):
         raise ValueError("Adapter does not describe the exact successful tune job")
+    if "parent_job" in job["lineage"]:
+        _training_policy(job)
+        if not job["inputs"]:
+            raise ValueError("Succeeded CL stage lacks its bound inputs")
+        metadata = manifest["metadata"]
+        inherited = {role: item["fingerprint"] for role, item in job["inputs"].items()
+                     if item["kind"] in ("adapter", "checkpoint")}
+        if (metadata.get("lineage") != job["lineage"]
+                or metadata.get("training_state_policy") != job["training_state_policy"]
+                or metadata.get("inherited_inputs") != inherited):
+            raise ValueError("CL adapter metadata disagrees with its recorded weight lineage")
     return {"manifest": str(manifest_path), "path": manifest["path"],
             "fingerprint": manifest["fingerprint"], "producer": manifest["producer"],
             "slot": manifest["metadata"]["slot"]}
@@ -245,11 +342,16 @@ def _summary(run_dir, invocation_dir, run, setting, jobs, started_at, status, de
                         "output_dir": record["output_dir"], "initial_status": info["initial_status"],
                         "returncode": info.get("returncode"), "log": info.get("log_path"),
                         "assignment": info.get("assignment"), "adapter": info.get("adapter"),
+                        "depends_on": record["depends_on"], "lineage": record["lineage"],
+                        "training_state_policy": record["training_state_policy"],
+                        "resume_training_state": record["resume_training_state"],
+                        "parent_adapter": info.get("parent_adapter"), "blocked_by": info.get("blocked_by", []),
                         "artifacts": [{**artifact, "manifest": str(info["directory"] / artifact["path"])}
                                       for artifact in record["artifacts"]]})
     result = {
         "schema_version": 1, "kind": "tune_run_summary", "experiment_id": run["experiment_id"],
         "run_id": run["run_id"], "setting": setting, "status": status,
+        "job_order": list(jobs), "task_order": [info["task"] for info in jobs.values()],
         "config_fingerprint": run["config_fingerprint"], "invocation_dir": str(invocation_dir),
         "started_at": started_at, "finished_at": utc_now(), "jobs": entries,
     }
@@ -275,7 +377,10 @@ def _collect(active, jobs, failures, *, stop_message=None):
         output_error = None
         if returncode == 0 and child["status"] == "succeeded":
             try:
-                info["adapter"] = _successful_adapter(info["directory"], child)
+                adapter = _successful_adapter(info["directory"], child)
+                if info["depends_on"]:
+                    info["parent_adapter"] = _parent_adapter(child, jobs, require_bound=True)
+                info["adapter"] = adapter
             except (OSError, ValueError, KeyError) as error:
                 output_error = str(error)
         execution_path = info["directory"] / "execution.json"
@@ -317,11 +422,14 @@ def _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receip
     job_python = info["snapshot"]["config"]["tune"]["run"]["python"]
     command = [job_python, str(low_level), "--job-dir", str(info["directory"]),
                "--gpu-group-index", str(resource["group_index"])]
+    for role, manifest in info.get("input_manifests", {}).items():
+        command.extend(["--input", "{}={}".format(role, manifest)])
     environment = os.environ.copy()
     environment.update(CUDA_VISIBLE_DEVICES=",".join(map(str, resource["physical_gpu_ids"])),
                        CUDA_DEVICE_ORDER="PCI_BUS_ID", PYTHONUNBUFFERED="1")
     launch = {"job_id": job_id, "command": command, "assignment": resource,
-              "log": str(log_path), "started_at": utc_now(), "pid": None, "status": "launching"}
+              "log": str(log_path), "started_at": utc_now(), "pid": None, "status": "launching",
+              "depends_on": info["depends_on"], "parent_adapter": info.get("parent_adapter")}
     info.update(log_path=str(log_path), assignment=resource)
     receipt["launches"].append(launch)
     write_json_atomic(invocation_dir / "execution.json", receipt)
@@ -341,7 +449,7 @@ def _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receip
 
 
 def execute_tune_run(run_dir):
-    """Schedule independent jobs using each job's frozen resource configuration."""
+    """Schedule independent jobs or a serial CL chain with frozen resources."""
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
     with _run_lock(run_dir), _signals() as signals:
         run_dir, run, snapshot, setting, jobs = _context(run_dir)
@@ -359,7 +467,7 @@ def execute_tune_run(run_dir):
         receipt = {"schema_version": 1, "run_id": run["run_id"], "experiment_id": run["experiment_id"],
                    "config_fingerprint": run["config_fingerprint"], "started_at": started_at,
                    "pid": os.getpid(), "status": "running", "max_parallel_jobs": capacity,
-                   "fail_fast": fail_fast, "launches": []}
+                   "fail_fast": fail_fast, "setting": setting, "job_order": list(jobs), "launches": []}
         write_json_atomic(invocation_dir / "execution.json", receipt)
         pending = [job_id for job_id in jobs if jobs[job_id]["initial_status"] == "planned"]
         active, failures = {}, []
@@ -391,14 +499,29 @@ def execute_tune_run(run_dir):
                         info = jobs[job_id]
                         if len(active) >= capacity:
                             break
+                        failed_ids = {item.get("job_id") for item in failures}
+                        blocked = [parent for parent in info["depends_on"]
+                                   if parent in failed_ids or record_status(jobs[parent]["directory"])["status"]
+                                   in ("failed", "cancelled")]
+                        if blocked:
+                            message = "Required preceding tune stage failed or was cancelled: {}".format(blocked)
+                            info["blocked_by"] = blocked
+                            _mark(info["directory"], "cancelled", message + "; job was not launched")
+                            failures.append({"job_id": job_id, "blocked_by": blocked, "message": message})
+                            pending.remove(job_id)
+                            continue
+                        if any(parent in pending or parent in active or "adapter" not in jobs[parent]
+                               for parent in info["depends_on"]):
+                            continue
                         resource = next((item for item in info["resources"]
                                          if not busy_gpus.intersection(item["physical_gpu_ids"])
                                          and item["port"] not in busy_ports), None)
                         if resource is None:
                             continue
                         try:
+                            _prepare_launch(info, jobs)
                             _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receipt, active)
-                        except (OSError, ValueError) as error:
+                        except (OSError, ValueError, KeyError) as error:
                             pending.remove(job_id)
                             _mark(info["directory"], "failed", "Cannot launch low-level executor: {}".format(error))
                             failures.append({"job_id": job_id, "message": str(error)})
@@ -415,6 +538,8 @@ def execute_tune_run(run_dir):
 
                 if active:
                     time.sleep(0.1)
+                elif pending and not (fail_fast and failures):
+                    raise ValueError("Pending tune jobs have no runnable dependencies or GPU assignment: {}".format(pending))
             if signals["number"] is not None:
                 raise InterruptedError("Tune orchestrator interrupted during execution")
         except (KeyboardInterrupt, InterruptedError):

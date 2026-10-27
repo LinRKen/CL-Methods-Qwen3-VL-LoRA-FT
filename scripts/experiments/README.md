@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 的执行器，以及 Multitask、Singletask 的高级 tune 编排。CL/Transfer tune 编排、infer、eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 的执行器，以及 Multitask、Singletask、CL 的高级 tune 编排。Transfer tune 编排、infer、eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -12,7 +12,7 @@
 - `lib/common.py`：ID、时间、JSON、指纹、原子写入和记录锁。
 - `lib/tune_executor.py`：校验冻结 tune job、限定设备并执行一次训练，保存日志和运行证据、登记 adapter 与完整 checkpoint。
 - `run_tune_job.py`：单 job 命令行入口；不调度同一高级 run 的其他 job。
-- `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的冻结 tune jobs，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
+- `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 tune jobs 或 CL 的串行训练链，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
 - `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
 - `requirements.txt`：配置层的 PyYAML 依赖，不替代各模型环境的依赖。
@@ -118,9 +118,9 @@ base、processor 和 annotation manifest 按冻结的 input_specs 自动生成�
 
 每个低级输出目录包含 `checkpoints/`（训练 checkpoint 与 training_result.json）、`adapter/`（最终可复用 LoRA adapter 和 processor）、`logs/`（训练日志及 W&B 文件）及执行收据 `execution.json`。完成后 adapter、完整训练 checkpoint 和 summary manifest 会登记到 job 的 artifacts/；失败或中断时，执行器会尝试保留已完整写入的 checkpoint manifest，作为显式恢复来源。低级执行器只将父高级 run 推进为 running，完成/失败的汇总由高级调度器处理。一次低级命令只运行一个 job。
 
-## Multitask 与 Singletask 高级 tune
+## 高级 tune 入口与资源调度
 
-`run_tune.py` 将一个 tune 高级 run 的任务交给多个低级 `run_tune_job.py` 进程；高级进程不加载模型。Multitask 只调度 `tune-whole`，使用 whole/train；Singletask 按 motion、hypo、pattern、nav、view、geo 的顺序放入队列，共六个 `tune-<task>`。每个任务从相同原始 base model 新建独立 LoRA、optimizer、scheduler、epoch 和 global step，不继承其他 task 的 adapter。该队列顺序不构成持续学习关系，并行任务的结束顺序可以不同。
+`run_tune.py` 将一个 tune 高级 run 的任务交给多个低级 `run_tune_job.py` 进程；高级进程不加载模型。Multitask 只调度 `tune-whole`，使用 whole/train；Singletask 按 motion、hypo、pattern、nav、view、geo 的顺序放入队列，共六个 `tune-<task>`。每个任务从相同原始 base model 新建独立 LoRA、optimizer、scheduler、epoch 和 global step，不继承其他 task 的 adapter。该队列顺序不构成持续学习关系，并行任务的结束顺序可以不同。CL 则按冻结的 task_order 串行训练六个阶段，具体继承关系见下文。
 
 从 setting YAML 创建新 experiment、冻结所有已启用阶段的计划及 job，然后只执行 tune。例如（本轮仅提供命令，未执行）：
 
@@ -134,7 +134,7 @@ base、processor 和 annotation manifest 按冻结的 input_specs 自动生成�
   --experiment-id singletask-example
 ~~~
 
-`--default`、`--set` 的含义与 `pipeline.py prepare` 一致；未指定值沿用默认 YAML。已有 experiment ID 不覆盖，重新实验使用新 ID。入口在创建记录前拒绝 CL、Zero-shot、Transfer 及未启用 tune 的配置。infer/eval 即使已登记，也只保持 planned。
+`--default`、`--set` 的含义与 `pipeline.py prepare` 一致；未指定值沿用默认 YAML。已有 experiment ID 不覆盖，重新实验使用新 ID。入口在创建记录前拒绝 Zero-shot、Transfer 及未启用 tune 的配置。infer/eval 即使已登记，也只保持 planned。
 
 已使用 prepare 建好记录，或先手动完成了其中若干低级 job 时，可指定其高级 tune run 目录：
 
@@ -150,11 +150,30 @@ base、processor 和 annotation manifest 按冻结的 input_specs 自动生成�
 - 高级 run 的 `tune.run.max_parallel_jobs` 限制并发低级进程数；`tune.run.fail_fast` 决定失败策略。这两个调度参数以高级 run 的冻结值为准，job 局部覆盖不改变整个 run 的策略。
 - 每个 job 使用自身合并后的 `tune.params`，以及 `tune.run.python`、`gpu_groups`、`master_addr`、`master_port` 和 W&B 设置；高级 CLI 覆盖继续按原配置优先级生效。
 - 调度器从各 job 的有效 `gpu_groups` 选择空闲组，按物理 GPU 集与 `master_addr`/`master_port + group_index` 避免本 run 内的资源冲突；低级执行器继续持有 GPU、端口和阶段槽位锁。job 局部 GPU 分组不同时也按实际设备处理。物理 GPU 0 始终禁止，训练与 W&B 使用同一分组。
-- `max_parallel_jobs: 1` 或只有一组 GPU 时依次训练。配置多组独立 GPU 并提高并发上限后可并行；单组可含多张 GPU，由低级执行器使用 torchrun。
-- `fail_fast: true` 在发现首个失败后停止派发，并请求其他活动低级进程退出、等待其关闭训练进程及登记已完整写出的 checkpoint；未启动任务标为 cancelled。`false` 继续其他独立任务，最后仍将有失败的高级 run 标为 failed。如果低级进程已经退出而 job 仍为 running，或其执行收据记录清理失败，调度器停止整个 run，保留失败证据供检查残留训练进程，不继续复用该设备。
+- `max_parallel_jobs: 1` 或只有一组 GPU 时依次训练。Multitask/Singletask 的独立任务配置多组独立 GPU 并提高并发上限后可并行；CL 的任务依赖仍强制六阶段串行。单组可含多张 GPU，由低级执行器使用 torchrun。
+- `fail_fast: true` 在发现首个失败后停止派发，并请求其他活动低级进程退出、等待其关闭训练进程及登记已完整写出的 checkpoint；未启动任务标为 cancelled。`false` 继续其他独立任务，最后仍将有失败的高级 run 标为 failed；CL 后续阶段依赖前一阶段，即使关闭 fail_fast，依赖失败或 adapter 审计失败后也会取消后续阶段。如果低级进程已经退出而 job 仍为 running，或其执行收据记录清理失败，调度器停止整个 run，保留失败证据供检查残留训练进程，不继续复用该设备。
 - SIGINT/SIGTERM 同样停止派发、请求低级清理并等待退出，保留已有成功产物与证据，整体记为 cancelled。高级层不强杀仍在清理或保存 checkpoint 的低级进程。
 
-每次高级调用在 run 记录树内新建 `orchestrations/<invocation-id>/`，保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`；低级详细训练日志仍位于原 payload 的 `logs/train.log`。run 根目录的 `tune-summary.json` 保存最新汇总，列出每个 job 的状态、退出码、GPU/端口分配、日志、输出目录及 adapter manifest 路径/指纹/producer/slot。若 adapter 内容或来源复核失败，高级 run 不记录成功，即使该 job 先前已是 succeeded。
+每次高级调用在 run 记录树内新建 `orchestrations/<invocation-id>/`，保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`；低级详细训练日志仍位于原 payload 的 `logs/train.log`。run 根目录的 `tune-summary.json` 保存最新汇总，列出 job_order/task_order、每个 job 的状态、退出码、GPU/端口分配、日志、输出目录及 adapter manifest 路径/指纹/producer/slot，并记录 depends_on、lineage、training_state_policy、是否显式恢复、父 adapter 的 manifest/指纹/producer 和依赖阻断原因。若 adapter 内容或来源复核失败，高级 run 不记录成功，即使该 job 先前已是 succeeded。
 
-所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。CL/Transfer 调度、infer/eval 自动运行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
+所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。Transfer 调度、infer/eval 自动运行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
 
+## CL 持续学习高级 tune
+
+CL-MHPNVG（easy2difficult）使用 configs/cl_mhpnvg.yaml，默认顺序为 motion → hypo → pattern → nav → view → geo。自定义 CL 使用 configs/cl_custom.yaml，在 experiment.task_order 填入六个 task 的完整排列；每个 task 必须且只能出现一次。两者均通过 setting: cl 使用同一高级入口。例如（仅为使用示例，本轮未执行）：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_tune.py --config scripts/experiments/configs/cl_mhpnvg.yaml --experiment-id cl-mhpnvg-example
+
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_tune.py --config scripts/experiments/configs/cl_custom.yaml --experiment-id cl-custom-example
+~~~
+
+高级入口将顺序冻结为 tune-01-<task> 至 tune-06-<task> 六个低级 job。第一阶段从原始 base model 新建 LoRA；第二阶段起继续训练前一阶段的同一个 LoRA，只继承其参数，每阶段重新初始化 optimizer、scheduler、epoch 和 global step。不会把 adapter 合入 base model，不会额外叠加一个新 adapter，也不会跨 task 继承完整训练状态。各 job 的训练参数和 GPU 分组仍按既有默认 YAML → setting → job → CLI 的优先级解析。
+
+调度器等待父低级执行器退出、job 成功且最终 adapter 的内容与登记来源核对通过后，才启动下一阶段；低级上下文检查也延迟到该依赖就绪时执行。未绑定输入时自动传入 --input parent-<task>=<父 job 登记的绝对 adapter manifest 路径>；已有绑定则核对它与同一 experiment、同一 tune run 的前一 job 产物完全一致，不重复传入或覆盖。检查包含 producer、slot、配置指纹、lineage、训练状态策略和继承输入指纹，不能用其他 task、其他 run 的 adapter 或最新 checkpoint 替换。
+
+即使 max_parallel_jobs 大于 1、配置了多组 GPU，单条 CL 链也只会有一个活动训练 job。前一阶段失败、adapter 审计失败或启动前继承检查失败时，不启动其后的阶段；fail_fast: false 也不能绕过依赖。SIGINT/SIGTERM 沿用高级停止和低级清理流程。已经成功的 adapter 保留，未启动的后续阶段记为 cancelled；失败和审计原因保存在汇总 details，依赖阻断的 job 另外记录 blocked_by。
+
+--run-dir 可以接管仍为 planned/running 的高级 run，但已成功的 CL 阶段必须组成连续前缀；跳过之前会复核最终 adapter 和父权重绑定关系。非连续成功记录、错绑父 adapter、尚未成功的 producer 或已开始/终态失败的 job 均不会被当成新的训练入口。显式同 task 的完整 checkpoint 恢复仍由低级入口处理；恢复成功后可接管其余 planned 阶段，高级调度器不自动寻找 checkpoint 或创建 retry。
+
+六个阶段的最终 adapter 分别保留在各自的 <checkpoints_root>/<experiment_id>/<run_id>/<job_id>/adapter/，后续训练不会覆盖前一阶段的权重。tune-summary.json 按训练顺序给出全部六个 adapter 及父子来源链，供后续 infer/eval 使用；现有计划仍是六个 adapter 分别测试六个 task，共 36 对结果，本轮不执行 infer/eval，也不调整 YAML 参数。
