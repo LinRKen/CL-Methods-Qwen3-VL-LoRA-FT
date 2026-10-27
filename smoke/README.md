@@ -102,3 +102,9 @@ CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwe
 2026-10-27 验证通过：CPU 27 项全部通过；物理 GPU 1 上实际运行 Multitask 的一个 whole job 与 Singletask 的六个独立 task jobs，七项均成功。每 job 使用 4 条真实样本、2 optimizer steps，初始 LoRA 一致、最终权重更新；134 项产物/退出审计通过；范围审计记录了一项 index 字节差异，额外核验确认暂存文件内容保持不变。命令、配置与边界见 [编排验证报告](reports/TUNE_ORCHESTRATOR_20261027.md)。
 
 验证代码为 `scripts/test_tune_orchestrator.py` 和 `scripts/run_tune_orchestrator_gpu.py`。CPU 入口屏蔽 GPU 并替换训练 worker；GPU 入口调用真实高级 CLI，固定物理 GPU 1 串行训练全部七个 job。均要求预先创建全新 smoke/results 子目录，并显式传入 `--result-dir`。GPU 入口的 `--verify-only` 只在 CPU 审计已有产物，不重新训练；本轮已完成，不重复启动。
+
+## 持续学习高级 tune 编排验证
+
+2026-10-27 第四步验证通过：CL 新增 CPU 18 项与既有编排回归 27 项共 45 项全部通过；物理 GPU 1 上完成 4B 的 motion → hypo → pattern → nav → view → geo 六阶段短训练，每阶段 4 条真实样本、2 optimizer steps。135 项产物/继承/退出检查通过：后五阶段各 288 张量精确继承父 adapter，各阶段 optimizer、scheduler 与训练进度重新计数；最终权重均更新。详见 [CL 编排验证报告](reports/CL_TUNE_ORCHESTRATOR_20261027.md)。
+
+新增 CPU 入口为 `scripts/test_cl_tune_orchestrator.py --result-dir <全新目录>`；真实训练入口为 `scripts/run_cl_tune_orchestrator_gpu.py --result-dir <全新目录>`，固定物理 GPU 1，会启动六阶段短训练。后者的 `--verify-only` 只在 CPU 审计已有产物。结果路径必须在 smoke/results 下，CPU 入口及只读审计应设置 `CUDA_VISIBLE_DEVICES=`、`PYTHONDONTWRITEBYTECODE=1`、`GIT_OPTIONAL_LOCKS=0`。本轮已完成，不重复训练；只改 smoke，未提交。

@@ -35,6 +35,7 @@ def fake_job(argv):
     p = argparse.ArgumentParser()
     p.add_argument('--job-dir', required=True)
     p.add_argument('--gpu-group-index', type=int, default=0)
+    p.add_argument('--input', action='append', default=[])
     a = p.parse_args(argv)
     job = Path(a.job_dir)
     mode = json.loads(os.environ.get('SMOKE_JOB_MODES', '{}')).get(job.name, 'success')
@@ -51,7 +52,7 @@ def fake_job(argv):
         return REAL_POPEN([sys.executable, '-B', str(REPO / 'smoke/scripts/test_tune_executor.py'), '--fake-worker', *command[start:]], **{**kw, 'env': env})
     try:
         with patch.object(ex, '_gpu_identity', side_effect=identity), patch.object(ex.subprocess, 'Popen', side_effect=worker):
-            ex.execute_tune_job(job, gpu_group_index=a.gpu_group_index)
+            ex.execute_tune_job(job, gpu_group_index=a.gpu_group_index, input_manifests={k: read_json(v) for k,v in (x.split('=', 1) for x in a.input)})
         if mode == 'corrupt':
             out = Path(load_job(job)[0]['output_dir']) / 'adapter/adapter_model.safetensors'
             out.write_bytes(b'corrupt')
@@ -304,7 +305,7 @@ class T(unittest.TestCase):
         self.assertFalse((run / 'orchestrations').exists())
 
     def test_cli_rejects_unsupported_and_disabled_tune(self):
-        for setting in ('cl', 'transfer_round1', 'zero_shot'):
+        for setting in ('transfer_round1', 'zero_shot'):
             p = self.config(setting, {'experiment': {'enabled_stages': ['infer', 'eval']}} if setting == 'zero_shot' else None)
             q = subprocess.run([sys.executable, '-B', str(LIB / 'run_tune.py'), '--config', str(p)], capture_output=True)
             self.assertEqual(q.returncode, 1)
