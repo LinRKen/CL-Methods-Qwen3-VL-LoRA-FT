@@ -1,4 +1,4 @@
-"""High-level Multitask/Singletask/CL tune entry point using frozen job records."""
+"""High-level tune entry point using frozen job records."""
 
 import argparse
 import json
@@ -20,7 +20,7 @@ else:
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     source = parser.add_mutually_exclusive_group(required=True)
-    source.add_argument("--config", type=Path, help="Multitask, Singletask or CL setting YAML for a new experiment")
+    source.add_argument("--config", type=Path, help="Multitask, Singletask, CL or transfer setting YAML for a new experiment")
     source.add_argument("--run-dir", type=Path, help="Absolute existing tune stage-run directory; use frozen configuration")
     parser.add_argument("--default", dest="default_path", type=Path, default=None,
                         help="Default YAML for --config; omitted uses configs/default.yaml")
