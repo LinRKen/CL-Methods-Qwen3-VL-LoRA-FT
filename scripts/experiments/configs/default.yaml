@@ -1,0 +1,113 @@
+# Shared defaults; setting YAMLs only need to specify differences.
+# Parameter values remain provisional until the final YAML review.
+experiment:
+  name: cosine
+  setting: cl
+  tasks: [motion, hypo, pattern, nav, view, geo]
+  task_order: [motion, hypo, pattern, nav, view, geo]
+  enabled_stages: [tune, infer, eval]
+  repo_root: /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT
+  dataset_root: /home/linruikang/data/datasets/COSINE
+  base_model: /home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct
+  processor_path: /home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct
+  judge_model: /home/linruikang/data/checkpoints/Qwen3-VL-8B-Instruct
+  records_root: /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT
+  checkpoints_root: /home/linruikang/data/checkpoints/SFT/Qwen3VL-LoRA-FT
+  infer_root: /home/linruikang/data/infer-results/Qwen3VL-LoRA-FT
+  eval_root: /home/linruikang/data/eval-results/Qwen3VL-LoRA-FT
+
+tune:
+  params:
+    num_train_epochs: 3
+    per_device_train_batch_size: 1
+    gradient_accumulation_steps: 16
+    learning_rate: 0.0005
+    weight_decay: 0
+    warmup_ratio: 0.03
+    max_grad_norm: 1
+    lr_scheduler_type: cosine
+    optim: adamw_torch
+    bf16: true
+    fp16: false
+    model_max_length: 8192
+    gradient_checkpointing: true
+    dataloader_num_workers: 4
+    logging_steps: 1
+    seed: 42
+    data_seed: 42
+    data_flatten: true
+    data_packing: false
+    tune_mm_vision: false
+    tune_mm_mlp: true
+    tune_mm_llm: true
+    lora_enable: true
+    lora_r: 128
+    lora_alpha: 256
+    lora_dropout: 0.0
+    min_pixels: 784
+    max_pixels: 50176
+    video_min_frames: 4
+    video_max_frames: 8
+    video_min_pixels: 200704
+    video_max_pixels: 802816
+    video_fps: 2
+    base_interval: 2
+    eval_strategy: "no"
+    save_strategy: epoch
+    save_steps: 500
+    save_total_limit: 3
+    report_to: wandb
+    deepspeed: /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT/qwen-vl-finetune/scripts/zero3.json
+  run:
+    python: /home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python
+    gpu_groups: [[2, 3]]
+    max_parallel_jobs: 1
+    fail_fast: true
+    master_addr: 127.0.0.1
+    master_port: 29501
+    wandb_project: Qwen3VL-LoRA-FT
+    wandb_mode: online
+  jobs: {}
+
+infer:
+  params:
+    batch_size: 4
+    dtype: bfloat16
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.9
+    max_model_len: 32768
+    max_new_tokens: 256
+    do_sample: false
+    temperature: 0.7
+    top_p: 0.9
+    seed: 0
+    min_pixels: 784
+    max_pixels: 50176
+    video_min_frames: 4
+    video_max_frames: 8
+    video_min_pixels: 200704
+    video_max_pixels: 802816
+    video_fps: 2
+  run:
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    gpu_groups: [[1]]
+    max_parallel_jobs: 1
+    fail_fast: true
+  jobs: {}
+
+eval:
+  params:
+    batch_size: 4
+    dtype: bfloat16
+    tensor_parallel_size: 1
+    gpu_memory_utilization: 0.8
+    max_model_len: 8192
+    max_new_tokens: 256
+    repair_attempts: 1
+    seed: 42
+  run:
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    gpu_groups: [[1]]
+    max_parallel_jobs: 1
+    fail_fast: true
+  jobs: {}

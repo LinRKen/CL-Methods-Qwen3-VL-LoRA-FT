@@ -1,0 +1,5 @@
+# Inherits configs/default.yaml; specify only setting-specific differences.
+experiment:
+  name: zero-shot
+  setting: zero_shot
+  enabled_stages: [infer, eval]
