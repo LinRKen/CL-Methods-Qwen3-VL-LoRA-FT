@@ -50,8 +50,15 @@ def fake_job(argv):
         env = dict(kw['env'])
         env['SMOKE_FAKE_MODE'] = 'failure' if mode == 'failure' else 'success'
         return REAL_POPEN([sys.executable, '-B', str(REPO / 'smoke/scripts/test_tune_executor.py'), '--fake-worker', *command[start:]], **{**kw, 'env': env})
+    # Keep real flock behavior, but simulated jobs must never claim real GPU locks.
+    real_exclusive = ex._exclusive
+    lock_root = Path(load_job(job)[1]['config']['experiment']['records_root']).parent / 'cpu-resource-locks'
+    def isolated_lock(path, **kwargs):
+        if path.parent == Path('/tmp/qwen3vl-lora-tune-locks'):
+            path = lock_root / path.name
+        return real_exclusive(path, **kwargs)
     try:
-        with patch.object(ex, '_gpu_identity', side_effect=identity), patch.object(ex.subprocess, 'Popen', side_effect=worker):
+        with patch.object(ex, '_exclusive', side_effect=isolated_lock), patch.object(ex, '_gpu_identity', side_effect=identity), patch.object(ex.subprocess, 'Popen', side_effect=worker):
             ex.execute_tune_job(job, gpu_group_index=a.gpu_group_index, input_manifests={k: read_json(v) for k,v in (x.split('=', 1) for x in a.input)})
         if mode == 'corrupt':
             out = Path(load_job(job)[0]['output_dir']) / 'adapter/adapter_model.safetensors'
@@ -305,11 +312,11 @@ class T(unittest.TestCase):
         self.assertFalse((run / 'orchestrations').exists())
 
     def test_cli_rejects_unsupported_and_disabled_tune(self):
-        for setting in ('transfer_round1', 'zero_shot'):
+        for setting in ('zero_shot',):
             p = self.config(setting, {'experiment': {'enabled_stages': ['infer', 'eval']}} if setting == 'zero_shot' else None)
             q = subprocess.run([sys.executable, '-B', str(LIB / 'run_tune.py'), '--config', str(p)], capture_output=True)
             self.assertEqual(q.returncode, 1)
-            self.assertIn(b'supports only', q.stderr)
+            self.assertIn(b'does not support setting', q.stderr)
         p = self.config('multitask', {'experiment': {'enabled_stages': ['infer', 'eval']}})
         q = subprocess.run([sys.executable, '-B', str(LIB / 'run_tune.py'), '--config', str(p)], capture_output=True)
         self.assertEqual(q.returncode, 1)

@@ -87,7 +87,7 @@ class CLTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError,'registration changed'): orch._parent_adapter(child,jobs)
     def test_exact_bound_parent_manifest_checked(self):
         _,run,_=self.prepare(); self.prefix(run,2); *_,jobs=orch._context(run); child,_=load_job(run/'jobs/tune-02-hypo'); child=deepcopy(child); role=next(k for k,v in child['inputs'].items() if v['kind']=='adapter'); child['inputs'][role]=read_json(run/'jobs/tune-02-hypo/artifacts/adapter.json')
-        with self.assertRaisesRegex(ValueError,'differs from the preceding'): orch._parent_adapter(child,jobs,require_bound=True)
+        with self.assertRaisesRegex(ValueError,'differs from the registered parent'): orch._parent_adapter(child,jobs,require_bound=True)
     def test_cli_cl_tune_only_preserves_other_stages(self):
         p=self.config('cl'); q=subprocess.run([sys.executable,'-B',str(b.SELF),'--fake-high','--config',str(p),'--experiment-id','cli-cl'],capture_output=True,text=True); self.assertEqual(q.returncode,0,q.stderr)
         exp=Path(load_config(p)['config']['experiment']['records_root'])/'cli-cl'; rec,_=b.load_experiment(exp); self.assertEqual({x['stage']:record_status(exp/x['path'])['status'] for x in rec['stage_runs']},{'tune':'succeeded','infer':'planned','eval':'planned'})

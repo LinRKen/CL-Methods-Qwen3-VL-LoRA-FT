@@ -108,3 +108,11 @@ CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwe
 2026-10-27 第四步验证通过：CL 新增 CPU 18 项与既有编排回归 27 项共 45 项全部通过；物理 GPU 1 上完成 4B 的 motion → hypo → pattern → nav → view → geo 六阶段短训练，每阶段 4 条真实样本、2 optimizer steps。135 项产物/继承/退出检查通过：后五阶段各 288 张量精确继承父 adapter，各阶段 optimizer、scheduler 与训练进度重新计数；最终权重均更新。详见 [CL 编排验证报告](reports/CL_TUNE_ORCHESTRATOR_20261027.md)。
 
 新增 CPU 入口为 `scripts/test_cl_tune_orchestrator.py --result-dir <全新目录>`；真实训练入口为 `scripts/run_cl_tune_orchestrator_gpu.py --result-dir <全新目录>`，固定物理 GPU 1，会启动六阶段短训练。后者的 `--verify-only` 只在 CPU 审计已有产物。结果路径必须在 smoke/results 下，CPU 入口及只读审计应设置 `CUDA_VISIBLE_DEVICES=`、`PYTHONDONTWRITEBYTECODE=1`、`GIT_OPTIONAL_LOCKS=0`。本轮已完成，不重复训练；只改 smoke，未提交。
+
+## 两轮迁移高级 tune 编排验证
+
+2026-10-27 第五步验证通过：CPU 62 项全部通过；物理 GPU 1 上完成 4B 的 6 个第一轮和 30 个第二轮真实短训练，每 job 4 条样本、2 optimizer steps。741 项审计全部通过，30 个第二轮 job 的各 288 个张量精确继承对应 source 的第一轮 final adapter，训练状态重新计数，最终权重均更新。范围检查 10 项全过，未改生产代码或提交。详情见 [Transfer 编排验证报告](reports/TRANSFER_TUNE_ORCHESTRATOR_20261027.md)。
+
+CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/test_tune_orchestrator.py 和 scripts/test_cl_tune_orchestrator.py；均须指定 --result-dir、预先创建全新 smoke/results 子目录，并设置 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0。
+
+真实训练入口 scripts/run_transfer_tune_orchestrator_gpu.py 固定物理 GPU 1，以 4B Instruct、每 task 四条样本、每 job 两步训练 transfer_round1 的全部 36 个 job；不能复用已有证据目录，也不要重复启动已有训练。两个 Transfer setting 的 tune 图相同，round2 的完整编排与下游 task 区别由 CPU 模拟覆盖。--verify-only 只用 CPU 审计已有结果，不启动训练。完整数据、真实多卡及实际 infer/eval 不在此次验证范围。
