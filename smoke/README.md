@@ -122,3 +122,11 @@ CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/tes
 2026-10-28 第六步验证完成：CPU 136 项、GPU 产物/输入审计 81 项、只读增强审计 44 项、最终范围审计 10 项全部通过。仅物理 GPU 1 上用 4B Instruct 运行 Zero-shot/base 与 Multitask/LoRA，每个 job 对六个 task 各处理 4 条，合计 48 条非空预测；每个 job 只加载一次 vLLM。LoRA 复用此前成功训练的 adapter，本轮没有训练。整卡显存观测最大 18,708 MiB（非严格峰值），收尾无计算进程、显存 2 MiB。详见[验证报告](reports/INFER_EXECUTOR_20261028.md)。
 
 新增验证脚本为 scripts/test_infer_executor.py、scripts/test_infer_resources.py、scripts/run_infer_executor_gpu.py 和 scripts/audit_infer_executor.py。CPU 入口参数 --result-root 须指向全新目录；GPU runner 会真实运行推理，--audit-only 只读核验已有结果。增强审计只检查已有产物和进程，不加载模型。结果位于 results/infer-executor-20261028-DbHyQYMS/，本轮已完成，不重复启动。
+
+## 实验高级 infer 编排验证
+
+2026-10-28 第七步验证完成：CPU 176 项与真实 GPU 产物/退出审计 119 项全部通过。物理 GPU 1 上用 4B Instruct 执行 Zero-shot/base 和 Multitask/LoRA 两个高级 run，每个 run 一个低级 job，一次加载 engine/模型处理六个 task 各 4 条，合计 48/48 非空。整卡显存观测最大 18,708 MiB（非严格峰值），收尾无计算进程、显存 2 MiB。详见[验证报告](reports/INFER_ORCHESTRATOR_20261028.md)。
+
+新增 scripts/test_infer_orchestrator.py --result-root <全新且尚不存在的目录> 与 scripts/run_infer_orchestrator_gpu.py --result-root <全新目录>。所有结果必须位于 smoke/results 下；CPU 使用 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0，GPU runner 固定物理 GPU 1，--audit-only 只审计已有结果。真实入口为高级 run_infer.py，完整命令见结果下 gpu-real/high-cases.json。
+
+证据为 results/infer-orchestrator-20261028-t1qglfpo/。Multitask 复用已有成功 adapter，本轮未训练、未 eval；其他 setting/并发/失败路径由 CPU 模拟覆盖。首轮 smoke fixture 失败和 NCCL 退出告警保留。仅改 smoke，未提交；本轮完成，不重复推理。
