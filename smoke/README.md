@@ -116,3 +116,9 @@ CUDA_VISIBLE_DEVICES= PYTHONDONTWRITEBYTECODE=1   /home/linruikang/data/envs/Qwe
 CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/test_tune_orchestrator.py 和 scripts/test_cl_tune_orchestrator.py；均须指定 --result-dir、预先创建全新 smoke/results 子目录，并设置 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0。
 
 真实训练入口 scripts/run_transfer_tune_orchestrator_gpu.py 固定物理 GPU 1，以 4B Instruct、每 task 四条样本、每 job 两步训练 transfer_round1 的全部 36 个 job；不能复用已有证据目录，也不要重复启动已有训练。两个 Transfer setting 的 tune 图相同，round2 的完整编排与下游 task 区别由 CPU 模拟覆盖。--verify-only 只用 CPU 审计已有结果，不启动训练。完整数据、真实多卡及实际 infer/eval 不在此次验证范围。
+
+## 按 Adapter 的 vLLM 推理执行器验证
+
+2026-10-28 第六步验证完成：CPU 136 项、GPU 产物/输入审计 81 项、只读增强审计 44 项、最终范围审计 10 项全部通过。仅物理 GPU 1 上用 4B Instruct 运行 Zero-shot/base 与 Multitask/LoRA，每个 job 对六个 task 各处理 4 条，合计 48 条非空预测；每个 job 只加载一次 vLLM。LoRA 复用此前成功训练的 adapter，本轮没有训练。整卡显存观测最大 18,708 MiB（非严格峰值），收尾无计算进程、显存 2 MiB。详见[验证报告](reports/INFER_EXECUTOR_20261028.md)。
+
+新增验证脚本为 scripts/test_infer_executor.py、scripts/test_infer_resources.py、scripts/run_infer_executor_gpu.py 和 scripts/audit_infer_executor.py。CPU 入口参数 --result-root 须指向全新目录；GPU runner 会真实运行推理，--audit-only 只读核验已有结果。增强审计只检查已有产物和进程，不加载模型。结果位于 results/infer-executor-20261028-DbHyQYMS/，本轮已完成，不重复启动。
