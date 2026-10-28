@@ -130,3 +130,9 @@ CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/tes
 新增 scripts/test_infer_orchestrator.py --result-root <全新且尚不存在的目录> 与 scripts/run_infer_orchestrator_gpu.py --result-root <全新目录>。所有结果必须位于 smoke/results 下；CPU 使用 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0，GPU runner 固定物理 GPU 1，--audit-only 只审计已有结果。真实入口为高级 run_infer.py，完整命令见结果下 gpu-real/high-cases.json。
 
 证据为 results/infer-orchestrator-20261028-t1qglfpo/。Multitask 复用已有成功 adapter，本轮未训练、未 eval；其他 setting/并发/失败路径由 CPU 模拟覆盖。首轮 smoke fixture 失败和 NCCL 退出告警保留。仅改 smoke，未提交；本轮完成，不重复推理。
+
+## 第八步批量 Qwen 柔性评测执行器验证
+
+2026-10-28，第八步低级 eval 执行器在 test/pipeline-automation 验证完成。CPU eval 套件 40 项中首轮 38 项通过、2 项 smoke fixture 错误；修复夹具后两项定向复测通过。资源用例 3 项、基础回归 77 项、冻结计划回归 26 项全部通过。物理 GPU 1 上 Zero-shot/base 与 Multitask/whole-LoRA 各运行一个 job，对六 task 各四条样本完成 Qwen3-VL-8B-Instruct 柔性判分，共 48 条；每 job 一次 judge 加载，CLI 返回 0。32 项 GPU 审计和 214 项扩展审计通过。验证记录见 [EVAL_EXECUTOR_20261028.md](reports/EVAL_EXECUTOR_20261028.md)。
+
+结果目录：results/eval-executor-20261028-XekckS2O/。真实评测复用第七步 infer smoke 预测；生成上限为 32 tokens，样本较少且预测存在截断，仅验证执行链，不用于模型效果判断。日志包含 NCCL process-group 退出告警，但进程清理、GPU 释放核验通过。仅物理 GPU 1；GPU 0 未使用，2/3 未干预。仅改 smoke，未提交；本步已完成，不重复执行。
