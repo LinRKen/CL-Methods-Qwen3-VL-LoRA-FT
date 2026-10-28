@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 和 Adapter/base infer job 的执行器，以及 Multitask、Singletask、CL、Transfer-round1 和 Transfer-round2 的高级 tune 编排。高级 infer 编排和 eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 和 Adapter/base infer job 的执行器，以及高级 tune 和实验 infer 编排。eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -15,6 +15,8 @@
 - `lib/infer_executor.py`：核对冻结 infer job 和输入来源，分配获准设备、启动一个 worker，并登记逐 task prediction 和运行汇总。
 - `lib/infer_worker.py`：一个 Adapter/base 只创建一个 vLLM engine，复用既有 COSINE 推理函数顺序完成该 job 的全部测试 task。
 - `run_infer_job.py`：单个 Adapter/base 推理任务入口；不调度同一高级 run 的其他 adapter。
+- `lib/infer_orchestrator.py`：核对冻结 infer 计划、解析同一实验的成功 tune adapter，调度各 Adapter/base job，管理资源、失败、中断和逐 task 产物汇总。
+- `run_infer.py`：高级 infer 入口；执行已有冻结 infer run，覆盖全部 setting，只执行推理阶段。
 - `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 jobs、CL 串行链和 Transfer 两轮分支，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
 - `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。支持 Multitask、Singletask、CL 和两种 Transfer setting，只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
@@ -135,7 +137,7 @@ Zero-shot 使用其 infer-base job 目录，不传 adapter。--input ROLE=/绝�
 
 模型与生成参数全部使用 job 的有效 infer.params：batch_size、dtype、tensor_parallel_size、显存利用率、上下文/生成长度、采样开关、temperature、top_p 和 seed。图像 min/max pixels、视频 min/max pixels、min/max frames 和 FPS 显式应用到选定 processor，并保存临时模型视图供 vLLM 使用；原模型和 processor 文件不改写。视频由既有媒体函数抽帧后送入 vLLM，避免二次抽帧。每个 task 使用完整 test 标注，不增加样本数或批次数的隐式限制。
 
-worker 先预检该 job 全部 task，合并所需媒体数量上限，再创建一次 vLLM engine 和至多一个 LoRA request。按冻结的 tasks 顺序复用同一 engine 完成全部数据；每个 task 内按 batch_size 批量生成。多个 adapter 仍是多个独立低级 job；当前没有自动派发这些 job 的高级 infer 入口。完成后关闭引擎并清理临时模型视图。
+worker 先预检该 job 全部 task，合并所需媒体数量上限，再创建一次 vLLM engine 和至多一个 LoRA request。按冻结的 tasks 顺序复用同一 engine 完成全部数据；每个 task 内按 batch_size 批量生成。多个 adapter 是多个独立低级 job，可由高级 run_infer.py 自动派发。完成后关闭引擎并清理临时模型视图。
 
 --gpu-group-index 选择冻结 infer.run.gpu_groups 的零起始索引；组内卡数必须等于 tensor_parallel_size。只接受物理 1、2、3，启动 CUDA 前核对 NVML UUID 和 PCI 顺序，并在 worker 再核对设备身份。推理进程使用冻结的 infer.run.python，执行时该 Python 环境需具有既有 Qwen3-VL/vLLM 推理依赖。GPU 文件锁与 tune 共用，阶段槽位按父高级 infer run 的 max_parallel_jobs 限制；低级入口不承担整个高级 run 的 fail_fast 调度。
 
@@ -151,7 +153,30 @@ inference_result.json
 
 prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth、dataset、样本索引/ID、完整 _meta 和 generation。每个 task 完成后核对全量条数、顺序及 GT/元信息；空回答统计为 empty_predictions，交给后续 eval 处理。全部 task 完成且输入指纹未变化后，在 job 的 artifacts/ 登记 prediction-<task>.json 和 inference-summary.json，随后将 job 标为 succeeded。
 
-失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态留给后续高级编排汇总。eval 与最终 YAML 参数核对仍留待后续阶段。
+失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态由高级编排汇总。eval 与最终 YAML 参数核对仍留待后续阶段。
+
+## 高级 infer 入口与资源调度
+
+先通过 pipeline.py prepare 或高级 tune 入口创建实验记录。训练型 setting 完成同一 experiment 的高级 tune run 后，独立启动其 infer run；Zero-shot 直接使用 prepare 创建的 infer run。高级入口只接受既有冻结 run，不重新读取当前 YAML、不创建新实验，也不自动启动 tune/eval。例如（仅提供用法，本轮未执行）：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_infer.py --run-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>
+~~~
+
+高级进程不加载模型；每个 Adapter/base 只启动一个 run_infer_job.py，在一个 vLLM engine 中完成该 job 全部 task。Zero-shot 一个 base job 测六 task；Multitask 一个 whole adapter job 测六 task；Singletask 六个 adapter 分别测对应 task；CL 按冻结训练顺序派发六个 adapter，各测六 task，合计 36 份预测。两种 Transfer 各使用三十个第二轮 adapter；round1 测第一轮 source task，round2 测第二轮 target task。全部测试 task 都使用完整 test 标注。
+
+非 Zero-shot 要求同一 experiment 唯一登记的 tune run 已成功，并按每个 infer job 的 requires、adapter_ref 和 slot 精确查找成功 producer 的 final adapter manifest；自动传给低级入口。不会搜索最新 checkpoint、跨实验取权重或把其他 adapter 当成替代品。Zero-shot 不绑定 adapter。
+
+- 高级 run 的 infer.run.max_parallel_jobs 和 fail_fast 控制整个 run 的并发与失败策略。每个 job 的 infer.params、infer.run.python 和 gpu_groups 使用自身冻结有效配置；高级入口不覆写局部设置。调整 YAML 后需重新 prepare 实验，已有 run 始终读取原快照。
+- 调度器按各 job 的有效 GPU 组和 tensor_parallel_size 选择本 run 内空闲的物理设备，不重叠派发；仅允许物理 GPU 1–3。低级执行器继续持有与 tune 共用的 GPU 锁及本 infer run 的槽位锁，启动 worker 前核对设备身份。max_parallel_jobs 为 1 或只有一组设备时顺序执行；多个独立组可并行处理不同 adapter。CL 的推理不要求串行继承，六个已完成 adapter 可独立推理。
+- fail_fast 为 true 时，发现失败即停止派发，请求其他活动低级入口清理退出，未启动 job 标为 cancelled；为 false 时继续其他独立 job，最终有任何失败则高级 run 失败。若低级退出但清理收据缺失/损坏、cleanup_completed 未确认或记录清理错误，则不论 fail_fast 都停止整个 run，保留证据，避免复用清理未确认的设备。
+- SIGINT/SIGTERM 停止派发并等待低级入口关闭其 worker 和临时模型视图；保留已成功预测及失败证据，整体记为 cancelled。高级层不强杀仍在清理的低级进程。
+
+可接管 planned/running 高级 run 中未执行的 planned jobs 和已完成的 succeeded jobs；已成功 job 只有在输入、adapter 来源、执行收据、一次模型加载、完整逐 task 预测和汇总都通过只读复核后才跳过。running、failed/cancelled job，或已有 inputs、执行收据/输出的 planned job 会被拒绝，需先人工审查。不自动重试、不续写部分预测、不覆盖终态；不要同时通过低级入口启动同一 run 的 job。
+
+每次高级调用在记录树的 orchestrations/<invocation-id>/ 保存 execution.json、各低级入口的 <job-id>.log 及 summary.json；infer-summary.json 保存本次总体汇总。汇总记录 job/task 顺序、状态、退出码、设备分配、输出目录、日志、adapter manifest/producer/slot/指纹及逐 task prediction/summary manifest。只有全部计划 job 成功且完整预测产物复核通过，高级 infer run 才记为 succeeded；产物复核失败不会改写已经终态的子 job，但高级 run 会失败并记录原因。
+
+失败或中断仅终结本 infer run，不提前结束 experiment；全部已登记阶段均成功时 experiment 才成功，默认启用 eval 的实验在 infer 完成后继续保持 active。高级 CLI 成功返回 0、失败返回 1、中断返回 130。eval 后端及最终 YAML 参数核对仍留给后续阶段。
 
 ## 高级 tune 入口与资源调度
 
@@ -191,7 +216,7 @@ prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth�
 
 每次高级调用在 run 记录树内新建 `orchestrations/<invocation-id>/`，保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`；低级详细训练日志仍位于原 payload 的 `logs/train.log`。run 根目录的 `tune-summary.json` 保存最新汇总，列出 job_order/task_order、每个 job 的状态、退出码、GPU/端口分配、日志、输出目录及 adapter manifest 路径/指纹/producer/slot，并记录 depends_on、lineage、training_state_policy、是否显式恢复、父 adapter 的 manifest/指纹/producer 和依赖阻断原因。若 adapter 内容或来源复核失败，高级 run 不记录成功，即使该 job 先前已是 succeeded。
 
-所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。infer/eval 自动运行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
+所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。训练后可独立调用高级 infer 入口；eval 执行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
 
 ## Transfer 两轮迁移高级 tune
 
