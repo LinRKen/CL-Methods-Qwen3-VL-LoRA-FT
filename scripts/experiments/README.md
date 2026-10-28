@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 和 Adapter/base infer job 的执行器，以及高级 tune 和实验 infer 编排。eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单，低级 LoRA tune、Adapter/base infer 和批量 Qwen 柔性 eval 执行器，以及高级 tune 和实验 infer 编排。高级 eval 编排仍待后续阶段。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -17,6 +17,9 @@
 - `run_infer_job.py`：单个 Adapter/base 推理任务入口；不调度同一高级 run 的其他 adapter。
 - `lib/infer_orchestrator.py`：核对冻结 infer 计划、解析同一实验的成功 tune adapter，调度各 Adapter/base job，管理资源、失败、中断和逐 task 产物汇总。
 - `run_infer.py`：高级 infer 入口；执行已有冻结 infer run，覆盖全部 setting，只执行推理阶段。
+- `lib/eval_executor.py`：核对冻结 eval job、成功 infer 来源和精确 GT，绑定全部 prediction manifests，限定设备并登记逐对及整体评测产物。
+- `lib/eval_worker.py`：预检全部 prediction/GT 对，单次加载 Qwen/vLLM judge，复用既有 COSINE 柔性判分并保存 raw、scored 和 metrics。
+- `run_eval_job.py`：低级批量 eval 入口；执行一个 eval-judge-all job，处理该 setting 全部预测/测试 task 对。
 - `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 jobs、CL 串行链和 Transfer 两轮分支，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
 - `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。支持 Multitask、Singletask、CL 和两种 Transfer setting，只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
@@ -153,7 +156,43 @@ inference_result.json
 
 prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth、dataset、样本索引/ID、完整 _meta 和 generation。每个 task 完成后核对全量条数、顺序及 GT/元信息；空回答统计为 empty_predictions，交给后续 eval 处理。全部 task 完成且输入指纹未变化后，在 job 的 artifacts/ 登记 prediction-<task>.json 和 inference-summary.json，随后将 job 标为 succeeded。
 
-失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态由高级编排汇总。eval 与最终 YAML 参数核对仍留待后续阶段。
+失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态由高级编排汇总。高级 eval 编排与最终 YAML 参数核对仍留待后续阶段。
+
+## 低级批量 Qwen 柔性 eval 入口
+
+run_eval_job.py 执行已经 prepare 的单个 eval-judge-all 冻结 job。该 job 一次接收本 setting 的全部 prediction/task 对：Zero-shot、Multitask、Singletask 各 6 对，CL 36 对，Transfer-round1/round2 各 30 对。启动一个 worker，全部对共用一次 Qwen/vLLM engine 和一次 judge 权重加载；按冻结对顺序处理，每对内部使用 batch_size 批量评测。低级入口不负责自动搜集整个高级 run 的输入或结束父 run；高级 eval 编排留待第九步。
+
+须按 --input ROLE=/绝对路径/manifest.json 显式传入全部 prediction manifests，角色名不得重复。入口按 producer、slot 和 task 对应冻结 requires；不依赖角色名猜测测试集。每份预测必须由同一 experiment 唯一登记且已成功的 infer run 内对应成功 job 产生，manifest 已登记，完整预测、执行收据、一次模型加载和输入来源均需复核。非 Zero-shot producer 必须使用高级 infer 的标准 adapter 输入角色；其他自定义 adapter 角色当前不接受。judge-model、judge-processor 以及六 task 的 test annotation 按冻结 input_specs 自动生成或复核 manifest；GT 必须与 infer 当时绑定的 annotation manifest 完全一致。已绑定 inputs 不接受再次传参替换。
+
+以下仅为命令格式示例，本轮未执行。必须补齐该冻结 job 全部 scoring_pairs 对应的 --input，单独传入此处展示的一个 prediction 不能启动六 task 的完整评测：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_eval_job.py \
+  --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>/jobs/eval-judge-all \
+  --gpu-group-index 0 \
+  --input prediction-motion=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-base/artifacts/prediction-motion.json
+~~~
+
+worker 先对全部预测与精确 GT 做全量条数、顺序、ID、元信息和 prompt 预检，再创建共享 judge engine。不重新生成答案，不读媒体，不按样本数隐式截取，不增加基于正则的答案匹配。沿用 evaluation/COSINE 的既有 prompt 与计分：MCQ/OPEN 交由 Qwen 语义判断；MRA 由 Qwen 抽取数值后计算既有相对准确率；invalid 和解析失败计 0 且保留在分母。超长 judge prompt 按既有行为报错，不静默截断。
+
+模型与运行参数读取该 job 的冻结 eval.params/run：batch_size、dtype、tensor_parallel_size、gpu_memory_utilization、max_model_len、max_new_tokens、repair_attempts、seed 和 python，不重新读取后来修改的 YAML。--gpu-group-index 为冻结 eval.run.gpu_groups 的零起始索引，组内卡数须等于 tensor_parallel_size；只允许物理 GPU 1–3，复用 tune/infer 的物理设备锁和 eval 父 run 的槽位锁，启动前及 worker 内分别核对实际设备身份。
+
+输出根目录为 <eval_root>/<experiment_id>/<eval-run-id>/eval-judge-all/：
+
+~~~text
+execution.json
+evaluation.request.json
+logs/eval.log
+pairs/<prediction-job>--<task>/judge.raw.jsonl
+pairs/<prediction-job>--<task>/judge.scored.jsonl
+pairs/<prediction-job>--<task>/judge.metrics.json
+judge.metrics.json
+evaluation_result.json
+~~~
+
+逐对保存原始 judge 文本、解析/计分结果和 metrics，保留 prediction producer、task、输入指纹及 judge 配置来源。关闭 engine 后逐对从 raw 重建 scored/metrics，并核对输入未变化，再登记 judge_raw、judge_scored、逐对辅助 summary 和整体 summary；根级 judge.metrics.json 是唯一主 metrics，slot 为 combined。主指标为 combined_flat_rawacc，整体按全部预测/样本对加权；不同 adapter 对同一测试样本的结果分别保留，不去重，不把逐 task 的百分比直接取平均。
+
+失败或 SIGINT/SIGTERM 时保留已有文件、日志和执行证据，清理 worker 进程组，并将 job 记为 failed/cancelled；worker 已进入执行流程时另写 evaluation_failure.json。拒绝已有输出、执行收据和终态 job，不覆盖、不自动续写或重试。成功只在全部计划对与整体产物完整登记后记录；低级执行器仅将父 eval run 推进到 running，父 run/experiment 的最终汇总由后续高级编排负责。CLI 成功返回 0、失败 1、中断 130。
 
 ## 高级 infer 入口与资源调度
 
@@ -176,7 +215,7 @@ prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth�
 
 每次高级调用在记录树的 orchestrations/<invocation-id>/ 保存 execution.json、各低级入口的 <job-id>.log 及 summary.json；infer-summary.json 保存本次总体汇总。汇总记录 job/task 顺序、状态、退出码、设备分配、输出目录、日志、adapter manifest/producer/slot/指纹及逐 task prediction/summary manifest。只有全部计划 job 成功且完整预测产物复核通过，高级 infer run 才记为 succeeded；产物复核失败不会改写已经终态的子 job，但高级 run 会失败并记录原因。
 
-失败或中断仅终结本 infer run，不提前结束 experiment；全部已登记阶段均成功时 experiment 才成功，默认启用 eval 的实验在 infer 完成后继续保持 active。高级 CLI 成功返回 0、失败返回 1、中断返回 130。eval 后端及最终 YAML 参数核对仍留给后续阶段。
+失败或中断仅终结本 infer run，不提前结束 experiment；全部已登记阶段均成功时 experiment 才成功，默认启用 eval 的实验在 infer 完成后继续保持 active。高级 CLI 成功返回 0、失败返回 1、中断返回 130。高级 eval 编排及最终 YAML 参数核对仍留给后续阶段。
 
 ## 高级 tune 入口与资源调度
 
