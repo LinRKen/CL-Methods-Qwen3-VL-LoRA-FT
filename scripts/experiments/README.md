@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单，低级 LoRA tune、Adapter/base infer 和批量 Qwen 柔性 eval 执行器，以及高级 tune 和实验 infer 编排。高级 eval 编排仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单，低级 LoRA tune、Adapter/base infer 和批量 Qwen 柔性 eval 执行器，以及高级 tune、infer 和 eval 编排与结果汇总。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -24,6 +24,9 @@
 - `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。支持 Multitask、Singletask、CL 和两种 Transfer setting，只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
 - `requirements.txt`：配置层的 PyYAML 依赖，不替代各模型环境的依赖。
+
+- `lib/eval_orchestrator.py`：核对完整冻结 eval 计划，自动绑定同一实验成功 infer 产物，单次调度 judge，汇总结果表和 setting 矩阵。
+- `run_eval.py`：高级 eval 入口；执行已有冻结 eval run，不自动启动 tune 或 infer。
 
 ## 参数继承
 
@@ -156,11 +159,11 @@ inference_result.json
 
 prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth、dataset、样本索引/ID、完整 _meta 和 generation。每个 task 完成后核对全量条数、顺序及 GT/元信息；空回答统计为 empty_predictions，交给后续 eval 处理。全部 task 完成且输入指纹未变化后，在 job 的 artifacts/ 登记 prediction-<task>.json 和 inference-summary.json，随后将 job 标为 succeeded。
 
-失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态由高级编排汇总。高级 eval 编排与最终 YAML 参数核对仍留待后续阶段。
+失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态由高级编排汇总。高级 eval 可通过 run_eval.py 独立启动；最终 YAML 参数核对仍留待后续阶段。
 
 ## 低级批量 Qwen 柔性 eval 入口
 
-run_eval_job.py 执行已经 prepare 的单个 eval-judge-all 冻结 job。该 job 一次接收本 setting 的全部 prediction/task 对：Zero-shot、Multitask、Singletask 各 6 对，CL 36 对，Transfer-round1/round2 各 30 对。启动一个 worker，全部对共用一次 Qwen/vLLM engine 和一次 judge 权重加载；按冻结对顺序处理，每对内部使用 batch_size 批量评测。低级入口不负责自动搜集整个高级 run 的输入或结束父 run；高级 eval 编排留待第九步。
+run_eval_job.py 执行已经 prepare 的单个 eval-judge-all 冻结 job。该 job 一次接收本 setting 的全部 prediction/task 对：Zero-shot、Multitask、Singletask 各 6 对，CL 36 对，Transfer-round1/round2 各 30 对。启动一个 worker，全部对共用一次 Qwen/vLLM engine 和一次 judge 权重加载；按冻结对顺序处理，每对内部使用 batch_size 批量评测。低级入口不负责自动搜集整个高级 run 的输入或结束父 run；高级 run_eval.py 负责搜集冻结计划的全部输入并汇总父 run。
 
 须按 --input ROLE=/绝对路径/manifest.json 显式传入全部 prediction manifests，角色名不得重复。入口按 producer、slot 和 task 对应冻结 requires；不依赖角色名猜测测试集。每份预测必须由同一 experiment 唯一登记且已成功的 infer run 内对应成功 job 产生，manifest 已登记，完整预测、执行收据、一次模型加载和输入来源均需复核。非 Zero-shot producer 必须使用高级 infer 的标准 adapter 输入角色；其他自定义 adapter 角色当前不接受。judge-model、judge-processor 以及六 task 的 test annotation 按冻结 input_specs 自动生成或复核 manifest；GT 必须与 infer 当时绑定的 annotation manifest 完全一致。已绑定 inputs 不接受再次传参替换。
 
@@ -192,7 +195,7 @@ evaluation_result.json
 
 逐对保存原始 judge 文本、解析/计分结果和 metrics，保留 prediction producer、task、输入指纹及 judge 配置来源。关闭 engine 后逐对从 raw 重建 scored/metrics，并核对输入未变化，再登记 judge_raw、judge_scored、逐对辅助 summary 和整体 summary；根级 judge.metrics.json 是唯一主 metrics，slot 为 combined。主指标为 combined_flat_rawacc，整体按全部预测/样本对加权；不同 adapter 对同一测试样本的结果分别保留，不去重，不把逐 task 的百分比直接取平均。
 
-失败或 SIGINT/SIGTERM 时保留已有文件、日志和执行证据，清理 worker 进程组，并将 job 记为 failed/cancelled；worker 已进入执行流程时另写 evaluation_failure.json。拒绝已有输出、执行收据和终态 job，不覆盖、不自动续写或重试。成功只在全部计划对与整体产物完整登记后记录；低级执行器仅将父 eval run 推进到 running，父 run/experiment 的最终汇总由后续高级编排负责。CLI 成功返回 0、失败 1、中断 130。
+失败或 SIGINT/SIGTERM 时保留已有文件、日志和执行证据，清理 worker 进程组，并将 job 记为 failed/cancelled；worker 已进入执行流程时另写 evaluation_failure.json。拒绝已有输出、执行收据和终态 job，不覆盖、不自动续写或重试。成功只在全部计划对与整体产物完整登记后记录；低级执行器仅将父 eval run 推进到 running，父 run/experiment 的最终汇总由高级 run_eval.py 编排负责。CLI 成功返回 0、失败 1、中断 130。
 
 ## 高级 infer 入口与资源调度
 
@@ -215,7 +218,42 @@ evaluation_result.json
 
 每次高级调用在记录树的 orchestrations/<invocation-id>/ 保存 execution.json、各低级入口的 <job-id>.log 及 summary.json；infer-summary.json 保存本次总体汇总。汇总记录 job/task 顺序、状态、退出码、设备分配、输出目录、日志、adapter manifest/producer/slot/指纹及逐 task prediction/summary manifest。只有全部计划 job 成功且完整预测产物复核通过，高级 infer run 才记为 succeeded；产物复核失败不会改写已经终态的子 job，但高级 run 会失败并记录原因。
 
-失败或中断仅终结本 infer run，不提前结束 experiment；全部已登记阶段均成功时 experiment 才成功，默认启用 eval 的实验在 infer 完成后继续保持 active。高级 CLI 成功返回 0、失败返回 1、中断返回 130。高级 eval 编排及最终 YAML 参数核对仍留给后续阶段。
+失败或中断仅终结本 infer run，不提前结束 experiment；全部已登记阶段均成功时 experiment 才成功，默认启用 eval 的实验在 infer 完成后继续保持 active。高级 CLI 成功返回 0、失败返回 1、中断返回 130。高级 eval 可通过 run_eval.py 独立启动；最终 YAML 参数核对仍留给后续阶段。
+
+## 高级 eval 编排与结果汇总
+
+完成同一 experiment 的 infer run 后，使用已 prepare 的冻结 eval run 目录启动评测。入口只接受绝对路径，不重新读取当前 YAML、不创建新实验，不自动执行训练或推理。例如（仅说明用法，本轮未执行）：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_eval.py --run-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>
+~~~
+
+高级入口核对 experiment/run/job 的冻结配置、计划和登记关系，要求同一 experiment 唯一的 infer run 已成功；按 scoring_pairs 顺序绑定对应成功 infer job 的 prediction manifest，复核 producer、slot、task、内容指纹及推理时使用的精确 test GT。缺失、重复、跨实验、错位或被修改的预测会被拒绝，不搜索其他结果作为替代。
+
+一个高级 eval run 只有一个 eval-judge-all job。全部 prediction manifests 通过重复的 --input 参数一次传给 run_eval_job.py；低级执行器只加载一次 Qwen/vLLM judge，按 batch 完成全部评测。高级进程不加载模型，不改变既有 COSINE prompt 与计分规则。Zero-shot、Multitask、Singletask 各 6 对，CL 36 对，两种 Transfer 各 30 对。
+
+运行参数来自 job 的冻结 eval.params/run。唯一 judge job 固定选择其 eval.run.gpu_groups 的第一组，低级执行器等待与 tune/infer 共用的设备锁和 eval 槽位锁；只允许物理 GPU 1–3，不查询设备负载，不自动换卡。max_parallel_jobs 与 fail_fast 继续记录，但不会把唯一 job 拆成多个 judge 或多次加载模型。
+
+可接管 planned/running 高级 run 中未执行的 planned job 或已经成功的 succeeded job。成功 job 必须通过完整输入、执行请求、清理收据、逐对 raw/scored/metrics、整体指标及登记 manifest 的只读复核，才直接汇总并跳过模型启动。running、failed/cancelled job，或已有 inputs、收据、请求或输出的 planned job 会被拒绝；不自动重试、不续写、不覆盖已有评测。不要同时通过低级入口启动同一 run 的 job。
+
+每次调用在记录树的 orchestrations/<invocation-id>/ 保存 execution.json、eval-judge-all.log（实际启动低级 job 时）、summary.json，以及成功后生成的 results.json、results.csv、matrix.json、matrix.csv。run 根目录 eval-summary.json 保存总体状态、scoring_pairs、来源 infer run、低级 job 状态/设备/日志/产物，以及这些结果文件的绝对路径和 SHA-256。results.json 保留逐对指标、预测/GT/adapter 来源和指纹；results.csv 提供同序扁平表。底层 raw/scored/metrics 仍在原 eval payload 下。
+
+矩阵以 combined_flat_rawacc 的 0–1 比例保存，不转换为百分比：
+
+| Setting | 行 | 列 | 有效格数 |
+| --- | --- | --- | --- |
+| Zero-shot | base | 六个测试 task | 6 |
+| Multitask | whole adapter | 六个测试 task | 6 |
+| Singletask | 六个独立 task adapter | 六个测试 task，仅对应对角线 | 6 |
+| CL（包括 easy2difficult） | 按冻结 task_order 排列的六阶段 adapter | 六个测试 task | 36 |
+| Transfer-round1 | 第一轮 source task | 第二轮训练 task；每格测试 source task | 30 |
+| Transfer-round2 | 第一轮 source task | 第二轮训练 task；每格测试第二轮 task | 30 |
+
+列及非 CL 行的 task 顺序为 motion、hypo、pattern、nav、view、geo。未安排测试的格在 JSON 为 null、CSV 为空，不能当成 0 分；matrix.json 同时保存 sample_counts 与 pair_ids，区分未测和空数据。每条结果保留实际 test_task、CL 阶段或 Transfer source/second_round，避免混淆两种 Transfer 测试口径。
+
+整体 combined_flat_rawacc 直接沿用从全部 raw judgments 重建并复核的低级整体 metrics：所有 prediction/sample 对的 score_sum / total，不平均 task 百分比；不同 adapter 测同一样本仍分别计数。invalid 和解析失败保留在分母；空数据的 null 沿用既有计分定义。不会额外计算未经约定的遗忘率或迁移指标。
+
+SIGINT/SIGTERM 请求低级入口清理其 worker 并等待退出；高级层不强杀仍在关闭 vLLM 的进程。失败/中断保留低级证据，记录高级 run 为 failed/cancelled，不改写已成功子 job。只有所有计划 pair、清理证据及最终表格完整时，高级 run 才 succeeded；全部登记阶段均成功后 experiment 才 succeeded。失败不提前结束 experiment；CLI 返回码为成功 0、失败 1、中断 130。最终默认/setting YAML 参数核对仍为后续独立步骤。
 
 ## 高级 tune 入口与资源调度
 
@@ -255,7 +293,7 @@ evaluation_result.json
 
 每次高级调用在 run 记录树内新建 `orchestrations/<invocation-id>/`，保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`；低级详细训练日志仍位于原 payload 的 `logs/train.log`。run 根目录的 `tune-summary.json` 保存最新汇总，列出 job_order/task_order、每个 job 的状态、退出码、GPU/端口分配、日志、输出目录及 adapter manifest 路径/指纹/producer/slot，并记录 depends_on、lineage、training_state_policy、是否显式恢复、父 adapter 的 manifest/指纹/producer 和依赖阻断原因。若 adapter 内容或来源复核失败，高级 run 不记录成功，即使该 job 先前已是 succeeded。
 
-所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。训练后可独立调用高级 infer 入口；eval 执行、自动重试记录和最终 YAML 参数核对继续留待后续阶段。
+所有计划训练任务成功且 adapter 完整后，tune run 才变为 succeeded。本入口将失败或中断记录在 tune run/job 层，不提前结束整个 experiment；experiment 仅在所有已启用阶段均成功时记为 succeeded，默认启用 infer/eval 的实验训练完成后仍为 active。高级 CLI 成功返回 0，失败返回 1，中断返回 130。训练后可独立调用高级 infer 入口；eval 可通过高级 run_eval.py 独立执行；自动重试记录和最终 YAML 参数核对继续留待后续阶段。
 
 ## Transfer 两轮迁移高级 tune
 
