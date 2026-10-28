@@ -136,3 +136,13 @@ CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/tes
 2026-10-28，第八步低级 eval 执行器在 test/pipeline-automation 验证完成。CPU eval 套件 40 项中首轮 38 项通过、2 项 smoke fixture 错误；修复夹具后两项定向复测通过。资源用例 3 项、基础回归 77 项、冻结计划回归 26 项全部通过。物理 GPU 1 上 Zero-shot/base 与 Multitask/whole-LoRA 各运行一个 job，对六 task 各四条样本完成 Qwen3-VL-8B-Instruct 柔性判分，共 48 条；每 job 一次 judge 加载，CLI 返回 0。32 项 GPU 审计和 214 项扩展审计通过。验证记录见 [EVAL_EXECUTOR_20261028.md](reports/EVAL_EXECUTOR_20261028.md)。
 
 结果目录：results/eval-executor-20261028-XekckS2O/。真实评测复用第七步 infer smoke 预测；生成上限为 32 tokens，样本较少且预测存在截断，仅验证执行链，不用于模型效果判断。日志包含 NCCL process-group 退出告警，但进程清理、GPU 释放核验通过。仅物理 GPU 1；GPU 0 未使用，2/3 未干预。仅改 smoke，未提交；本步已完成，不重复执行。
+
+## 第九步实验评测编排与结果汇总验证
+
+2026-10-28，第九步在 test/pipeline-automation 验证完成：44 项高级 eval 用例首轮 37 项通过、7 项因同一 smoke 环境记录夹具错误失败，修正夹具后定向复测全部通过；另有基础 77 项、冻结计划 26 项、资源 3 项全部通过，共 150 个独立 CPU 用例，复测不重复计数。覆盖所有 setting 的结果映射、计分口径、冻结来源审计、唯一 judge job、失败发布清理和中断退出。
+
+真实链路使用生产高级 CLI 接管第八步已有成功的 Zero-shot 与 Multitask 8B 评分，128 项审计通过；本轮没有重新加载 judge 或启动 GPU 计算。Zero-shot 首个 smoke wrapper 超时后续接原进程，最终输出与状态成功，但退出码无法恢复；Multitask 返回 0。独立重建与进程审计 1,292 项通过，441 个记录 PID 均已退出。详细证据、初次失败和验证边界见 [EVAL_ORCHESTRATOR_20261028.md](reports/EVAL_ORCHESTRATOR_20261028.md)。
+
+新增 scripts/test_eval_orchestrator.py --result-root <尚不存在的 smoke/results 子目录>、scripts/run_eval_orchestrator_adoption.py 和 scripts/audit_eval_orchestrator.py。CPU 和接管入口设置 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0。接管 runner 专用于报告所列的既有 smoke 计划；--resume 续接原进程，不重跑已成功的高级 run。独立审计只读取已有结果，--report 必须指向该结果根下尚不存在的文件。
+
+证据为 results/eval-orchestrator-20261028-pYw7QiHv/。两份真实结果各 24 条，combined_flat_rawacc 为 24.58% 和 32.92%，仅用于核对历史汇总，原预测上限为 32 tokens 且存在截断，不代表正式效果。其他 setting 和故障路径由 CPU 模拟；本轮未覆盖新的真实 judge 初始化、全量或多卡。仅改 smoke，未提交；本轮已完成，不重复评测或自动开展 YAML 核对。
