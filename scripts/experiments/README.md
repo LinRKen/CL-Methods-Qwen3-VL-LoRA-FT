@@ -1,6 +1,6 @@
 # COSINE 实验配置与产物基础
 
-本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 的执行器，以及 Multitask、Singletask、CL、Transfer-round1 和 Transfer-round2 的高级 tune 编排。infer、eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
+本目录实现实验配置、计划、运行记录、产物清单、单个低级 LoRA tune job 和 Adapter/base infer job 的执行器，以及 Multitask、Singletask、CL、Transfer-round1 和 Transfer-round2 的高级 tune 编排。高级 infer 编排和 eval 执行后端仍待后续阶段。YAML 中的参数为待最终核对的初始值。
 
 ## 文件组织
 
@@ -12,6 +12,9 @@
 - `lib/common.py`：ID、时间、JSON、指纹、原子写入和记录锁。
 - `lib/tune_executor.py`：校验冻结 tune job、限定设备并执行一次训练，保存日志和运行证据、登记 adapter 与完整 checkpoint。
 - `run_tune_job.py`：单 job 命令行入口；不调度同一高级 run 的其他 job。
+- `lib/infer_executor.py`：核对冻结 infer job 和输入来源，分配获准设备、启动一个 worker，并登记逐 task prediction 和运行汇总。
+- `lib/infer_worker.py`：一个 Adapter/base 只创建一个 vLLM engine，复用既有 COSINE 推理函数顺序完成该 job 的全部测试 task。
+- `run_infer_job.py`：单个 Adapter/base 推理任务入口；不调度同一高级 run 的其他 adapter。
 - `lib/tune_orchestrator.py`：调度 Multitask/Singletask 的独立 jobs、CL 串行链和 Transfer 两轮分支，按有效资源分配 GPU 组、管理失败和中断、汇总状态与 adapter 来源。
 - `run_tune.py`：高级 tune 入口；从 YAML 新建实验，或执行已有 tune run。支持 Multitask、Singletask、CL 和两种 Transfer setting，只执行训练阶段。
 - `pipeline.py`：根据 setting 生成计划，或创建计划及配置记录。
@@ -117,6 +120,38 @@ python scripts/experiments/run_tune_job.py \
 base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，W&B 监控只筛选同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
 
 每个低级输出目录包含 `checkpoints/`（训练 checkpoint 与 training_result.json）、`adapter/`（最终可复用 LoRA adapter 和 processor）、`logs/`（训练日志及 W&B 文件）及执行收据 `execution.json`。完成后 adapter、完整训练 checkpoint 和 summary manifest 会登记到 job 的 artifacts/；失败或中断时，执行器会尝试保留已完整写入的 checkpoint manifest，作为显式恢复来源。低级执行器只将父高级 run 推进为 running，完成/失败的汇总由高级调度器处理。一次低级命令只运行一个 job。
+
+## 低级 Adapter/base infer 入口
+
+run_infer_job.py 只执行一个已经 prepare 的冻结 infer job。一个 job 绑定一个成功 tune job 的 final adapter；Zero-shot 不绑定 adapter。入口不调用旧推理 CLI，不重新读取当前 YAML，也不从数据注册表或最新 checkpoint 猜测输入。基础模型、processor 和每个 task 的 test 标注按冻结 input_specs 生成或复核 manifest；非 Zero-shot 必须显式传入已登记的 adapter manifest。
+
+以下示例只说明用法，本轮未执行；工作目录为仓库根目录：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_infer_job.py --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-whole --gpu-group-index 0 --input adapter=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<tune-run-id>/jobs/tune-whole/artifacts/adapter.json
+~~~
+
+Zero-shot 使用其 infer-base job 目录，不传 adapter。--input ROLE=/绝对路径/manifest.json 可按角色重复；已经绑定 inputs 的 job 不接受再次传入替换。adapter 必须来自同一 experiment 内冻结 requires 指定的 tune job，且 producer 已成功、manifest 已登记、slot/task、base 指纹、训练配置及 lineage 一致。不会将 adapter 合并进 base 或叠加多个 adapter。
+
+模型与生成参数全部使用 job 的有效 infer.params：batch_size、dtype、tensor_parallel_size、显存利用率、上下文/生成长度、采样开关、temperature、top_p 和 seed。图像 min/max pixels、视频 min/max pixels、min/max frames 和 FPS 显式应用到选定 processor，并保存临时模型视图供 vLLM 使用；原模型和 processor 文件不改写。视频由既有媒体函数抽帧后送入 vLLM，避免二次抽帧。每个 task 使用完整 test 标注，不增加样本数或批次数的隐式限制。
+
+worker 先预检该 job 全部 task，合并所需媒体数量上限，再创建一次 vLLM engine 和至多一个 LoRA request。按冻结的 tasks 顺序复用同一 engine 完成全部数据；每个 task 内按 batch_size 批量生成。多个 adapter 仍是多个独立低级 job；当前没有自动派发这些 job 的高级 infer 入口。完成后关闭引擎并清理临时模型视图。
+
+--gpu-group-index 选择冻结 infer.run.gpu_groups 的零起始索引；组内卡数必须等于 tensor_parallel_size。只接受物理 1、2、3，启动 CUDA 前核对 NVML UUID 和 PCI 顺序，并在 worker 再核对设备身份。推理进程使用冻结的 infer.run.python，执行时该 Python 环境需具有既有 Qwen3-VL/vLLM 推理依赖。GPU 文件锁与 tune 共用，阶段槽位按父高级 infer run 的 max_parallel_jobs 限制；低级入口不承担整个高级 run 的 fail_fast 调度。
+
+输出结构如下，根目录为 <infer_root>/<experiment_id>/<run_id>/<job_id>/：
+
+~~~text
+execution.json
+inference.request.json
+logs/infer.log
+predictions/<task>.jsonl
+inference_result.json
+~~~
+
+prediction 沿用既有 COSINE JSONL 格式，保留 prediction、ground_truth、dataset、样本索引/ID、完整 _meta 和 generation。每个 task 完成后核对全量条数、顺序及 GT/元信息；空回答统计为 empty_predictions，交给后续 eval 处理。全部 task 完成且输入指纹未变化后，在 job 的 artifacts/ 登记 prediction-<task>.json 和 inference-summary.json，随后将 job 标为 succeeded。
+
+失败或 SIGINT/SIGTERM 时保留日志、已生成文件和执行证据，清理该 worker 进程组，并将 job 标为 failed/cancelled；worker 已进入执行流程时另写 inference_failure.json。已有输出目录、执行收据、终态或正在执行的 job 会被拒绝，不覆盖、不自动续写部分预测或重试。低级入口只将父 infer run 推进为 running，整体完成状态留给后续高级编排汇总。eval 与最终 YAML 参数核对仍留待后续阶段。
 
 ## 高级 tune 入口与资源调度
 
