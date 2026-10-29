@@ -221,8 +221,17 @@ class FoundationTests(unittest.TestCase):
             with self.subTest(identifier=identifier), self.assertRaises(ValueError):
                 require_id(identifier)
 
+    def full_stage_config(self, template):
+        if template == 'transfer_round2':
+            # The shipped profile is source-bound infer/eval only; exercise its
+            # full 36-job tuning topology with an explicit tune-enabled variant.
+            with self.assertRaisesRegex(ConfigError, 'transfer_source_experiment_id'):
+                self.config(template)
+            return self.config(template, patch={'experiment': {'enabled_stages': ['tune', 'infer', 'eval']}})
+        return self.config(template)
+
     def assert_plan(self, template):
-        snap = self.config(template)
+        snap = self.full_stage_config(template)
         plan = pipeline.build_plan(snap)
         tune_count, infer_count, pairs_count = COUNTS[template]
         stages = plan['stages']
@@ -298,7 +307,7 @@ class FoundationTests(unittest.TestCase):
     def test_prepare_all_templates_and_no_workloads(self):
         for template, counts in COUNTS.items():
             with self.subTest(template=template):
-                snap = self.config(template)
+                snap = self.full_stage_config(template)
                 exp = pipeline.prepare_records(snap, 'prepare-' + template)
                 record, saved = load_experiment(exp)
                 self.assertEqual(saved, snap)

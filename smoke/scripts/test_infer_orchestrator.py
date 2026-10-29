@@ -114,7 +114,7 @@ class T(unittest.TestCase):
             (data/task).mkdir(parents=True)
             samples=[{'conversations':[{'from':'human','value':'question '+task},{'from':'gpt','value':'answer '+task}],'_meta':{'id':task+str(i),'sample_index':i+13,'task_type':'OPEN','metric_type':'ACC','nested':{'retain':True}}} for i in range(2)]
             for split in ('train','test'):write_json_atomic(data/task/(split+'.json'),samples)
-        self.doc={'experiment':{'name':'infer-orchestrator-smoke','setting':'zero_shot','enabled_stages':['infer','eval'],'base_model':str(base),'processor_path':str(base),'dataset_root':str(data),**{k:str(self.case/k) for k in ('records_root','checkpoints_root','infer_root','eval_root')}},'infer':{'run':{'python':sys.executable,'gpu_groups':[[1]],'max_parallel_jobs':1},'params':{'batch_size':2,'max_new_tokens':8,'max_model_len':8192}},'tune':{'params':{'lora_r':8,'lora_alpha':16}}}
+        self.doc={'experiment':{'name':'infer-orchestrator-smoke','setting':'zero_shot','enabled_stages':['infer','eval'],'base_model':str(base),'processor_path':str(base),'dataset_root':str(data),**{k:str(self.case/k) for k in ('records_root','checkpoints_root','infer_root','eval_root')},'logs_root':str(self.case/'logs_root')},'infer':{'run':{'python':sys.executable,'gpu_groups':[[1]],'max_parallel_jobs':1},'params':{'batch_size':2,'max_new_tokens':8,'max_model_len':8192}},'tune':{'params':{'lora_r':8,'lora_alpha':16}}}
     def prepare(self,setting='zero_shot',extra=None,adopt=True):
         self.n+=1; doc=deep_merge(self.doc,{'experiment':{'setting':setting,'enabled_stages':['infer','eval'] if setting=='zero_shot' else ['tune','infer','eval']}})
         if extra:doc=deep_merge(doc,extra)
@@ -125,8 +125,23 @@ class T(unittest.TestCase):
             for j in record_status(runs['tune'])['jobs']:adopt_cpu(runs['tune']/j['path'],parents)
             update_status(runs['tune'],'succeeded','CPU fake producer fixtures complete; training not executed')
         return exp,runs,path
+    def invocation_root(self,run):
+        record=read_json(run/'run.json');snapshot=read_json(run/record['config_snapshot']);config=snapshot['config']['experiment']
+        return Path(config.get('logs_root',config['records_root']))/record['experiment_id']/'stage-runs'/record['stage']/record['run_id']/'orchestrations'
+    def assert_logged_result(self,run,result):
+        folder=Path(result['invocation_dir']); self.assertTrue(folder.is_relative_to(self.invocation_root(run)))
+        receipt=read_json(folder/'invocation.json'); self.assertEqual(receipt['status'],result['status'])
+        self.assertTrue((folder/'orchestrator.log').is_file()); self.assertGreater((folder/'orchestrator.log').stat().st_size,0)
+        if result['status']=='succeeded':self.assertFalse((folder/'failure.json').exists())
+        else:
+            failure=read_json(folder/'failure.json'); self.assertEqual(failure['status'],result['status']); self.assertTrue(failure.get('details') or failure.get('traceback'))
+    def assert_new_failed_invocation(self,run,before):
+        added=set(self.invocation_root(run).glob('*'))-before; self.assertEqual(len(added),1,[str(x) for x in added])
+        folder=added.pop(); receipt=read_json(folder/'invocation.json'); failure=read_json(folder/'failure.json')
+        self.assertEqual(receipt['status'],'failed'); self.assertTrue(failure.get('traceback') or failure.get('details')); self.assertTrue((folder/'orchestrator.log').is_file())
     def execute(self,run,modes=None):
-        with patch.dict(os.environ,{'SMOKE_JOB_MODES':json.dumps(modes or {})}),patch.object(orch.subprocess,'Popen',side_effect=dispatch):return orch.execute_infer_run(run)
+        with patch.dict(os.environ,{'SMOKE_JOB_MODES':json.dumps(modes or {})}),patch.object(orch.subprocess,'Popen',side_effect=dispatch):result=orch.execute_infer_run(run)
+        self.assert_logged_result(run,result); return result
     def events(self,run):return {p.parent.name:read_json(p) for p in (run/'jobs').glob('*/cpu-event.json')}
     def peak(self,run):
         points=[]
@@ -136,9 +151,9 @@ class T(unittest.TestCase):
         for _,v in sorted(points):current+=v; peak=max(peak,current)
         return peak
     def reject(self,run):
-        before=set((run/'orchestrations').glob('*')) if (run/'orchestrations').exists() else set()
+        before=set(self.invocation_root(run).glob('*'))
         with patch.object(orch.subprocess,'Popen') as spawn,self.assertRaises((ValueError,OSError,KeyError,TypeError)):orch.execute_infer_run(run)
-        spawn.assert_not_called(); self.assertEqual(set((run/'orchestrations').glob('*')),before)
+        spawn.assert_not_called(); self.assert_new_failed_invocation(run,before)
     def first(self,run):return run/'jobs'/record_status(run)['jobs'][0]['job_id']
     def test_01_import_and_compile_cpu_only(self):
         self.assertFalse(set(sys.modules)&{'torch','transformers','vllm','peft','wandb','deepspeed'})

@@ -21,7 +21,7 @@ from lib import tune_executor as ex, tune_orchestrator as orch
 from lib.artifacts import check_manifest
 from lib.common import TASKS, read_json, write_json_atomic
 from lib.config import load_config, deep_merge
-from lib.records import load_experiment, load_job, record_status
+from lib.records import load_experiment, load_job, load_stage_run, record_status
 RESULT = None
 
 def identity(config, env, group):
@@ -99,7 +99,7 @@ class T(unittest.TestCase):
             (data / task / 'train.json').write_text('[]')
         ds = self.case / 'ds.json'
         ds.write_text('{}')
-        self.doc = {'experiment': {'name': 'smoke', 'setting': 'singletask', 'base_model': str(base), 'processor_path': str(base), 'dataset_root': str(data), **{k: str(self.case / k) for k in ('records_root', 'checkpoints_root', 'infer_root', 'eval_root')}}, 'tune': {'params': {'deepspeed': str(ds), 'lora_r': 8, 'lora_alpha': 16}, 'run': {'python': sys.executable, 'gpu_groups': [[1]], 'wandb_mode': 'offline', 'master_port': 29901}}}
+        self.doc = {'experiment': {'name': 'smoke', 'setting': 'singletask', 'base_model': str(base), 'processor_path': str(base), 'dataset_root': str(data), **{k: str(self.case / k) for k in ('records_root', 'checkpoints_root', 'infer_root', 'eval_root')}, 'logs_root': str(self.case / 'logs_root')}, 'tune': {'params': {'deepspeed': str(ds), 'lora_r': 8, 'lora_alpha': 16}, 'run': {'python': sys.executable, 'gpu_groups': [[1]], 'wandb_mode': 'offline', 'master_port': 29901}}}
 
     def config(self, setting='singletask', extra=None):
         self.n += 1
@@ -118,9 +118,43 @@ class T(unittest.TestCase):
         run = exp / next((x['path'] for x in rec['stage_runs'] if x['stage'] == 'tune'))
         return (exp, run, p)
 
+    def invocation_root(self, run):
+        record = read_json(run / 'run.json')
+        snapshot = read_json(run / record['config_snapshot'])
+        config = snapshot['config']['experiment']
+        return (Path(config.get('logs_root', config['records_root'])) / record['experiment_id'] /
+                'stage-runs' / record['stage'] / record['run_id'] / 'orchestrations')
+
+    def assert_logged_result(self, run, result):
+        folder = Path(result['invocation_dir'])
+        self.assertTrue(folder.is_relative_to(self.invocation_root(run)))
+        receipt = read_json(folder / 'invocation.json')
+        self.assertEqual(receipt['status'], result['status'])
+        self.assertTrue((folder / 'orchestrator.log').is_file())
+        self.assertGreater((folder / 'orchestrator.log').stat().st_size, 0)
+        if result['status'] == 'succeeded':
+            self.assertFalse((folder / 'failure.json').exists())
+        else:
+            failure = read_json(folder / 'failure.json')
+            self.assertEqual(failure['status'], result['status'])
+            self.assertTrue(failure.get('details') or failure.get('traceback'))
+
+    def assert_new_failed_invocation(self, run, before):
+        folders = self.invocation_root(run)
+        added = set(folders.glob('*')) - before
+        self.assertEqual(len(added), 1, [str(x) for x in added])
+        folder = added.pop()
+        receipt = read_json(folder / 'invocation.json')
+        failure = read_json(folder / 'failure.json')
+        self.assertEqual(receipt['status'], 'failed')
+        self.assertTrue(failure.get('traceback') or failure.get('details'))
+        self.assertTrue((folder / 'orchestrator.log').is_file())
+
     def execute(self, run, modes=None):
         with patch.dict(os.environ, {'SMOKE_JOB_MODES': json.dumps(modes or {})}), patch.object(orch.subprocess, 'Popen', side_effect=dispatch):
-            return orch.execute_tune_run(run)
+            result = orch.execute_tune_run(run)
+        self.assert_logged_result(run, result)
+        return result
 
     def events(self, run):
         return {p.parent.name: read_json(p) for p in (run / 'jobs').glob('*/cpu-event.json')}
@@ -137,10 +171,11 @@ class T(unittest.TestCase):
         return peak
 
     def reject(self, run):
+        before = set(self.invocation_root(run).glob('*'))
         with patch.object(orch.subprocess, 'Popen') as spawn, self.assertRaises((ValueError, OSError, KeyError)):
             orch.execute_tune_run(run)
         spawn.assert_not_called()
-        self.assertFalse((run / 'orchestrations').exists())
+        self.assert_new_failed_invocation(run, before)
 
     def test_cpu_import_and_syntax(self):
         self.assertFalse(set(sys.modules) & {'torch', 'transformers', 'peft', 'wandb', 'deepspeed', 'vllm'})
@@ -267,9 +302,10 @@ class T(unittest.TestCase):
     def test_terminal_stage_cannot_rerun(self):
         _, run, _ = self.prepare('multitask')
         self.execute(run)
+        before = set(self.invocation_root(run).glob('*'))
         with self.assertRaisesRegex(ValueError, 'active child'):
             orch.execute_tune_run(run)
-        self.assertEqual(len(list((run / 'orchestrations').iterdir())), 1)
+        self.assert_new_failed_invocation(run, before)
 
     def test_receipt_or_output_conflicts_are_preserved(self):
         _, run, _ = self.prepare('multitask')
@@ -307,9 +343,10 @@ class T(unittest.TestCase):
 
     def test_concurrent_high_level_lock_rejects_duplicate(self):
         _, run, _ = self.prepare('multitask')
+        before = set(self.invocation_root(run).glob('*'))
         with orch._run_lock(run), self.assertRaisesRegex(ValueError, 'Another high-level'):
             orch.execute_tune_run(run)
-        self.assertFalse((run / 'orchestrations').exists())
+        self.assert_new_failed_invocation(run, before)
 
     def test_cli_rejects_unsupported_and_disabled_tune(self):
         for setting in ('zero_shot',):

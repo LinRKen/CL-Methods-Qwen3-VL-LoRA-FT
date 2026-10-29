@@ -66,16 +66,31 @@ def dispatch(command,**kw):
     return REAL_POPEN([command[0],'-B',str(SELF),'--fake-job',*command[2:]],**kw)
 
 class HighTests(fx.EvalTests):
+    def invocation_root(self,run):
+        record=read_json(run/'run.json');snapshot=read_json(run/record['config_snapshot']);config=snapshot['config']['experiment']
+        return Path(config.get('logs_root',config['records_root']))/record['experiment_id']/'stage-runs'/record['stage']/record['run_id']/'orchestrations'
+    def assert_logged_result(self,run,result):
+        folder=Path(result['invocation_dir']);self.assertTrue(folder.is_relative_to(self.invocation_root(run)))
+        receipt=read_json(folder/'invocation.json');self.assertEqual(receipt['status'],result['status'])
+        self.assertTrue((folder/'orchestrator.log').is_file());self.assertGreater((folder/'orchestrator.log').stat().st_size,0)
+        if result['status']=='succeeded':self.assertFalse((folder/'failure.json').exists())
+        else:
+            failure=read_json(folder/'failure.json');self.assertEqual(failure['status'],result['status']);self.assertTrue(failure.get('details') or failure.get('traceback'))
+    def assert_new_failed_invocation(self,run,before):
+        added=set(self.invocation_root(run).glob('*'))-before;self.assertEqual(len(added),1,[str(x) for x in added])
+        folder=added.pop();receipt=read_json(folder/'invocation.json');failure=read_json(folder/'failure.json')
+        self.assertEqual(receipt['status'],'failed');self.assertTrue(failure.get('traceback') or failure.get('details'));self.assertTrue((folder/'orchestrator.log').is_file())
     def high(self,run,mode='success'):
         with patch.dict(os.environ,{'SMOKE_HIGH_EVAL_MODE':mode}),patch.object(orch.subprocess,'Popen',side_effect=dispatch):
-            return orch.execute_eval_run(run)
+            result=orch.execute_eval_run(run)
+        self.assert_logged_result(run,result);return result
     def reject_high(self,run):
-        before=set((run/'orchestrations').glob('*'))
+        before=set(self.invocation_root(run).glob('*'))
         with patch.object(orch.subprocess,'Popen') as spawn,patch.object(fx.ex,'_gpu_identity') as query,self.assertRaises((ValueError,KeyError,OSError,TypeError)):
             orch.execute_eval_run(run)
-        spawn.assert_not_called();query.assert_not_called();self.assertEqual(set((run/'orchestrations').glob('*')),before)
+        spawn.assert_not_called();query.assert_not_called();self.assert_new_failed_invocation(run,before)
     def check_exports(self,s,run,pairs,expected_total):
-        self.assertEqual(s['status'],'succeeded',s.get('details'));self.assertEqual(s['pair_count'],pairs);self.assertEqual(s['overall']['total'],expected_total)
+        self.assertEqual(s['status'],'succeeded',s.get('details'));self.assertEqual(s['pair_count'],pairs);self.assertEqual(s['overall']['total'],expected_total);self.assertEqual(s['invalid'],s['overall']['invalid'])
         self.assertEqual(record_status(run)['status'],'succeeded');self.assertEqual(read_json(run/'eval-summary.json'),s)
         folder=Path(s['invocation_dir']);r=read_json(folder/'results.json');m=read_json(folder/'matrix.json')
         self.assertEqual(r['matrix'],m);self.assertEqual(r['overall'],s['overall']);self.assertEqual(len(r['rows']),pairs)
