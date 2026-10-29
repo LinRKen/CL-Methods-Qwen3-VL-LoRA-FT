@@ -6,8 +6,8 @@ REPO_ROOT="$(cd -- "${SCRIPT_DIR}/../.." && pwd)"
 DATASET="${DATASET:-cosine_motion_test}"
 JUDGE_MODEL="${JUDGE_MODEL:-/home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct}"
 GPU_IDS="${GPU_IDS:-${CUDA_VISIBLE_DEVICES:-1}}"
-EVAL_PYTHON="${EVAL_PYTHON:-python}"
-OUTPUT_DIR="${OUTPUT_DIR:-/home/linruikang/data/eval-results/COSINE/${DATASET}/$(date +%Y%m%d-%H%M%S)}"
+EVAL_PYTHON="${EVAL_PYTHON:-/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python}"
+OUTPUT_DIR="${OUTPUT_DIR:-/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/legacy-eval/COSINE/${DATASET}/$(date +%Y%m%d-%H%M%S)}"
 # The Python entry verifies physical identity before importing CUDA libraries.
 export CUDA_VISIBLE_DEVICES="${GPU_IDS}"
 export CUDA_DEVICE_ORDER=PCI_BUS_ID

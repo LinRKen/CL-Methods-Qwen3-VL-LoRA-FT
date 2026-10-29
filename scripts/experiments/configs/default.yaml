@@ -89,7 +89,7 @@ infer:
     video_max_pixels: 802816
     video_fps: 2
   run:
-    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM/bin/python
     gpu_groups: [[1]]
     max_parallel_jobs: 1
     fail_fast: true
@@ -106,7 +106,7 @@ eval:
     repair_attempts: 1
     seed: 42
   run:
-    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM/bin/python
     gpu_groups: [[1]]
     max_parallel_jobs: 1
     fail_fast: true
