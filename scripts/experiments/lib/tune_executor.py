@@ -168,11 +168,14 @@ def _require_internal_inputs(job, inputs, experiment_dir):
     for reference in job["requires"]:
         if reference["artifact_kind"] != "adapter" or reference["stage"] != "tune":
             raise ValueError("A tune plan can inherit only a tune adapter as a business dependency")
+        expected_experiment = reference.get("experiment_id", job["experiment_id"])
+        if job["stage"] == "tune" and expected_experiment != job["experiment_id"]:
+            raise ValueError("Tune jobs cannot inherit an adapter from another experiment")
         matches = []
         for manifest in inputs.values():
             producer = manifest["producer"] or {}
             if (manifest["kind"] == reference["artifact_kind"]
-                    and producer.get("experiment_id") == job["experiment_id"]
+                    and producer.get("experiment_id") == expected_experiment
                     and producer.get("stage") == reference["stage"]
                     and producer.get("job_id") == reference["job_id"]
                     and all(manifest["metadata"].get(key) == reference[key]

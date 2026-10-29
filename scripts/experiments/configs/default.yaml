@@ -12,6 +12,7 @@ experiment:
   processor_path: /home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct
   judge_model: /home/linruikang/data/checkpoints/Qwen3-VL-8B-Instruct
   records_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT
+  logs_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT  # 高级编排日志及错误记录
   checkpoints_root: /home/linruikang/data/checkpoints/SFT/CL-Methods/Qwen3-VL/LoRA-FT
   infer_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT
   eval_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT

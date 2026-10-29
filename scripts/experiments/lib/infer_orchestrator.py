@@ -7,15 +7,18 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import traceback
 
 from .artifacts import check_manifest
-from .common import fingerprint, new_id, read_json, utc_now, write_json_atomic
+from .common import fingerprint, read_json, utc_now, write_json_atomic
 from .config import resolve_job_config
+from .orchestration_logging import run_logged
 from .infer_worker import inspect_predictions, load_samples
 from .records import (
     load_experiment, load_job, load_stage_run, record_status, update_status,
 )
 from .tune_orchestrator import _successful_adapter
+from .transfer import validate_transfer_infer_job, validate_transfer_source
 
 if __package__ == "lib":
     from pipeline import build_stage_plan
@@ -99,23 +102,32 @@ def _context(run_dir):
                         "resources": _resources(job_snapshot["config"], job_id)}
 
     if setting != "zero_shot":
-        registered_tune = [item for item in experiment["stage_runs"] if item["stage"] == "tune"]
-        if "tune" not in experiment_config["enabled_stages"] or len(registered_tune) != 1:
-            raise ValueError("This setting requires its registered tune stage to finish before inference")
-        registration = registered_tune[0]
-        tune_dir = experiment_dir / "stage-runs" / "tune" / registration["run_id"]
-        if registration["path"] != tune_dir.relative_to(experiment_dir).as_posix():
-            raise ValueError("Registered tune stage path differs from its identity")
-        tune_run, tune_snapshot = load_stage_run(tune_dir)
-        if (tune_run["stage"] != "tune" or tune_run["status"] != "succeeded"
-                or tune_run["run_id"] != registration["run_id"]
-                or tune_run["experiment_id"] != experiment_id
-                or tune_snapshot["config"]["experiment"] != experiment_config
-                or tune_snapshot["layers"].get("parent_snapshot") != experiment_snapshot["snapshot_fingerprint"]
-                or {"stage": "tune", "run_id": tune_run["run_id"],
-                    "path": tune_dir.relative_to(experiment_dir).as_posix()} not in experiment["stage_runs"]):
-            raise ValueError("The exact tune stage for this experiment has not succeeded")
-        _bind_adapter_sources(jobs, experiment_id, tune_dir, tune_run)
+        source_context = None
+        if setting == "transfer_round2" and experiment_config.get("transfer_source_experiment_id"):
+            source_context = validate_transfer_source(
+                snapshot, experiment_id, audit_adapters=True, require_frozen=True)
+        if source_context is not None:
+            _bind_adapter_sources(jobs, experiment_id, source_context["experiment_id"],
+                                  source_context["tune_dir"], source_context["tune_run"],
+                                  source_context=source_context)
+        else:
+            registered_tune = [item for item in experiment["stage_runs"] if item["stage"] == "tune"]
+            if "tune" not in experiment_config["enabled_stages"] or len(registered_tune) != 1:
+                raise ValueError("This setting requires its registered tune stage to finish before inference")
+            registration = registered_tune[0]
+            tune_dir = experiment_dir / "stage-runs" / "tune" / registration["run_id"]
+            if registration["path"] != tune_dir.relative_to(experiment_dir).as_posix():
+                raise ValueError("Registered tune stage path differs from its identity")
+            tune_run, tune_snapshot = load_stage_run(tune_dir)
+            if (tune_run["stage"] != "tune" or tune_run["status"] != "succeeded"
+                    or tune_run["run_id"] != registration["run_id"]
+                    or tune_run["experiment_id"] != experiment_id
+                    or tune_snapshot["config"]["experiment"] != experiment_config
+                    or tune_snapshot["layers"].get("parent_snapshot") != experiment_snapshot["snapshot_fingerprint"]
+                    or {"stage": "tune", "run_id": tune_run["run_id"],
+                        "path": tune_dir.relative_to(experiment_dir).as_posix()} not in experiment["stage_runs"]):
+                raise ValueError("The exact tune stage for this experiment has not succeeded")
+            _bind_adapter_sources(jobs, experiment_id, experiment_id, tune_dir, tune_run)
 
     for job_id, info in jobs.items():
         if info["initial_status"] == "succeeded":
@@ -139,7 +151,8 @@ def _resources(config, job_id):
     return resources
 
 
-def _bind_adapter_sources(jobs, experiment_id, tune_dir, tune_run):
+def _bind_adapter_sources(jobs, current_experiment_id, source_experiment_id, tune_dir, tune_run,
+                          *, source_context=None):
     tune_jobs = {item["job_id"]: tune_dir / "jobs" / item["job_id"] for item in tune_run["jobs"]}
     for job_id, info in jobs.items():
         job = info["record"]
@@ -148,15 +161,22 @@ def _bind_adapter_sources(jobs, experiment_id, tune_dir, tune_run):
             raise ValueError("Every trained setting infer job must require exactly one adapter: " + job_id)
         reference = references[0]
         source_id = job["lineage"].get("adapter_ref")
+        expected_experiment_id = job["lineage"].get("adapter_source_experiment_id", current_experiment_id)
         if (reference.get("stage") != "tune" or reference.get("artifact_kind") != "adapter"
                 or reference.get("job_id") != source_id or reference.get("slot") != job["output_spec"]["slot"]
+                or reference.get("experiment_id", current_experiment_id) != expected_experiment_id
+                or expected_experiment_id != source_experiment_id
                 or source_id not in tune_jobs):
             raise ValueError("Infer adapter reference differs from the frozen setting lineage: " + job_id)
         source_dir = tune_jobs[source_id]
         source_job, _ = load_job(source_dir)
-        if source_job["run_id"] != tune_run["run_id"] or source_job["experiment_id"] != experiment_id:
+        if source_job["run_id"] != tune_run["run_id"] or source_job["experiment_id"] != source_experiment_id:
             raise ValueError("Adapter source is outside this experiment's tune run: " + job_id)
-        adapter = _successful_adapter(source_dir, source_job)
+        if source_context is not None:
+            source_info = validate_transfer_infer_job(info["snapshot"], job, source_context)
+            adapter = source_info["adapter"]
+        else:
+            adapter = _successful_adapter(source_dir, source_job)
         if adapter["slot"] != reference["slot"]:
             raise ValueError("Adapter slot differs from the infer requirement: " + job_id)
         info["adapter"] = adapter
@@ -466,6 +486,10 @@ def _summary(run_dir, invocation_dir, run, setting, jobs, started_at, status, de
 
 def execute_infer_run(run_dir):
     """Schedule each frozen Adapter/base job once, preserving one vLLM load per job."""
+    return run_logged("infer", run_dir, _execute_infer_run)
+
+
+def _execute_infer_run(run_dir, invocation_dir):
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
     with _run_lock(run_dir), _signals() as signals:
         run_dir, run, snapshot, experiment_dir, setting, jobs = _context(run_dir)
@@ -477,8 +501,6 @@ def execute_infer_run(run_dir):
         if not low_level.is_file():
             raise ValueError("Low-level infer entry point is missing: {}".format(low_level))
         started_at = utc_now()
-        invocation_dir = run_dir / "orchestrations" / new_id("infer")
-        invocation_dir.mkdir(parents=True, exist_ok=False)
         receipt = {"schema_version": 1, "run_id": run["run_id"],
                    "experiment_id": run["experiment_id"],
                    "config_fingerprint": run["config_fingerprint"], "started_at": started_at,
@@ -526,7 +548,8 @@ def execute_infer_run(run_dir):
                             pending.remove(job_id)
                             _mark(info["directory"], "failed",
                                   "Cannot launch low-level infer executor: {}".format(error))
-                            failures.append({"job_id": job_id, "message": str(error)})
+                            failures.append({"job_id": job_id, "message": str(error),
+                                             "traceback": traceback.format_exc()})
                             write_json_atomic(invocation_dir / "execution.json", receipt)
                             if fail_fast:
                                 break
@@ -547,7 +570,8 @@ def execute_infer_run(run_dir):
             _cancel(pending, active, jobs, failures, "High-level infer run interrupted")
         except BaseException as error:
             _cancel(pending, active, jobs, failures, "Scheduler stopped: {}".format(error))
-            failures.append({"message": "{}: {}".format(type(error).__name__, error)})
+            failures.append({"message": "{}: {}".format(type(error).__name__, error),
+                             "traceback": traceback.format_exc()})
 
         child_statuses = [record_status(info["directory"])["status"] for info in jobs.values()]
         final_status = ("cancelled" if interrupted else

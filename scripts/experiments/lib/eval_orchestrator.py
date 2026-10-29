@@ -12,13 +12,15 @@ import signal
 import subprocess
 import tempfile
 import time
+import traceback
 
 from .artifacts import check_manifest, make_manifest
-from .common import TASKS, fingerprint, new_id, read_json, require_id, sha256_file, utc_now, write_json_atomic
+from .common import TASKS, fingerprint, read_json, require_id, sha256_file, utc_now, write_json_atomic
 from .config import resolve_job_config
 from .eval_executor import _inputs, _make_request, _planned_job, build_eval_command
 from .eval_worker import inspect_evaluation, pair_id
 from .infer_orchestrator import SUPPORTED_SETTINGS, _artifact_map, _mark, _signals
+from .orchestration_logging import run_logged
 from .records import load_experiment, load_job, load_stage_run, record_status, update_status
 
 if __package__ == "lib":
@@ -492,6 +494,7 @@ def _summary(run_dir, invocation_dir, run, snapshot, info, started_at, status, d
     if status == "succeeded":
         result.update(overall=results["overall"], pair_count=results["pair_count"],
                       combined_flat_rawacc=results["overall"]["combined_flat_rawacc"],
+                      invalid=results["overall"]["invalid"],
                       model_loads=results["model_loads"], matrix=results["matrix"])
     write_json_atomic(invocation_dir / "summary.json", result)
     write_json_atomic(run_dir / "eval-summary.json", result)
@@ -500,12 +503,14 @@ def _summary(run_dir, invocation_dir, run, snapshot, info, started_at, status, d
 
 def execute_eval_run(run_dir):
     """Score one complete frozen experiment with a single low-level judge load."""
+    return run_logged("eval", run_dir, _execute_eval_run)
+
+
+def _execute_eval_run(run_dir, invocation_dir):
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
     with _run_lock(run_dir), _signals() as signals:
         run, snapshot, experiment_dir, info = _context(run_dir)
         started_at = utc_now()
-        invocation_dir = run_dir / "orchestrations" / new_id("eval")
-        invocation_dir.mkdir(parents=True, exist_ok=False)
         config = snapshot["config"]
         receipt = {"schema_version": 1, "experiment_id": run["experiment_id"], "run_id": run["run_id"],
                    "config_fingerprint": run["config_fingerprint"], "started_at": started_at,
@@ -541,15 +546,19 @@ def execute_eval_run(run_dir):
             status = "succeeded"
         except (KeyboardInterrupt, InterruptedError) as error:
             status = "cancelled"
-            details.append({"type": type(error).__name__, "message": str(error)})
+            details.append({"type": type(error).__name__, "message": str(error),
+                            "traceback": traceback.format_exc()})
         except Exception as error:
-            details.append({"type": type(error).__name__, "message": str(error)})
+            details.append({"type": type(error).__name__, "message": str(error),
+                            "traceback": traceback.format_exc()})
         finally:
             try:
                 _finish_child(info, receipt, stop=True)
             except Exception as error:
                 status = "failed"
-                details.append({"type": type(error).__name__, "message": "Child cleanup failed: " + str(error)})
+                details.append({"type": type(error).__name__,
+                                "message": "Child cleanup failed: " + str(error),
+                                "traceback": traceback.format_exc()})
         if status != "succeeded":
             # Only discard this invocation's derived exports. Preserve every
             # low-level raw judgment, metric, log and execution receipt.

@@ -7,11 +7,13 @@ import sys
 
 if __package__ in (None, ""):
     from lib.config import dotted_overrides, load_config
+    from lib.orchestration_logging import record_preparation_failure
     from lib.records import load_experiment
     from lib.tune_orchestrator import execute_tune_run, require_supported_setting
     from pipeline import prepare_records
 else:
     from .lib.config import dotted_overrides, load_config
+    from .lib.orchestration_logging import record_preparation_failure
     from .lib.records import load_experiment
     from .lib.tune_orchestrator import execute_tune_run, require_supported_setting
     from .pipeline import prepare_records
@@ -30,6 +32,8 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if args.run_dir is not None and (args.default_path is not None or args.set or args.experiment_id is not None):
         parser.error("--run-dir cannot be combined with --default, --set or --experiment-id")
+    snapshot = None
+    execution_started = False
     try:
         if args.config is not None:
             overrides = dotted_overrides(args.set) if args.set else {}
@@ -45,11 +49,16 @@ def main(argv=None):
                 raise ValueError("--run-dir must be an absolute path")
             run_dir = args.run_dir
         print("Tune stage run: {}".format(run_dir), flush=True)
+        execution_started = True
         result = execute_tune_run(run_dir)
     except (KeyboardInterrupt, InterruptedError) as error:
+        if snapshot is not None and not execution_started:
+            record_preparation_failure("tune", snapshot, error)
         print(str(error) or "Tune orchestration interrupted", file=sys.stderr)
         return 130
     except Exception as error:
+        if snapshot is not None and not execution_started:
+            record_preparation_failure("tune", snapshot, error)
         print("{}: {}".format(type(error).__name__, error), file=sys.stderr)
         return 1
     print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
