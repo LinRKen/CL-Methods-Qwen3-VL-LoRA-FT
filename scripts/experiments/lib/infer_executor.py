@@ -16,6 +16,7 @@ from .infer_worker import inspect_predictions, load_samples
 from .records import bind_inputs, load_experiment, load_job, load_stage_run, register_artifact, update_status
 from .tune_executor import (_adapter_config, _exclusive, _registered_producer,
                             _require_internal_inputs, _signals, _stop_group, _wait_launcher)
+from .transfer import validate_transfer_infer_job, validate_transfer_source
 
 
 @contextmanager
@@ -166,6 +167,17 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
     expected_adapters = 0 if experiment["setting"] == "zero_shot" else 1
     if len(adapters) != expected_adapters or len(job["requires"]) != expected_adapters:
         raise ValueError("Infer requires exactly one planned adapter, or none for Zero-shot")
+    if experiment["setting"] == "transfer_round2" and experiment.get("transfer_source_experiment_id"):
+        source_context = validate_transfer_source(
+            snapshot, job["experiment_id"], audit_adapters=False, require_frozen=True,
+            adapter_job_id=job["lineage"].get("adapter_ref"))
+        validate_transfer_infer_job(snapshot, job, source_context, adapters[0])
+    if adapters:
+        reference = job["requires"][0]
+        expected_source = job["lineage"].get("adapter_source_experiment_id", job["experiment_id"])
+        reference_source = reference.get("experiment_id", job["experiment_id"])
+        if reference_source != expected_source:
+            raise ValueError("Infer adapter source differs from its frozen lineage")
     _require_internal_inputs(job, inputs, experiment_dir)
     for adapter in adapters:
         source = _registered_producer(adapter, experiment["records_root"])

@@ -53,6 +53,7 @@ EXPERIMENT_FIELDS = {
     "enabled_stages": "stages", "repo_root": "path", "dataset_root": "path",
     "base_model": "path", "processor_path": "path", "judge_model": "path",
     "records_root": "path", "checkpoints_root": "path", "infer_root": "path", "eval_root": "path",
+    "transfer_source_experiment_id": "id", "logs_root": "path",
 }
 TUNE_FIELDS = {
     "num_train_epochs": "positive", "per_device_train_batch_size": "positive_int",
@@ -156,11 +157,11 @@ def _check_leaf(value, rule, key):
         raise AssertionError("Unknown field rule: {}".format(rule))
 
 
-def _check_mapping(value, fields, key, partial=False):
+def _check_mapping(value, fields, key, partial=False, optional=()):
     if not isinstance(value, dict):
         _fail(key, "expected a mapping")
     unknown = set(value) - set(fields)
-    missing = set(fields) - set(value)
+    missing = set(fields) - set(value) - set(optional)
     if unknown:
         _fail(key, "unknown keys: {}".format(sorted(unknown)))
     if missing and not partial:
@@ -186,7 +187,8 @@ def validate_config(value, partial=False):
     if set(value) - root or (not partial and set(value) != root):
         raise ConfigError("Root keys must be experiment, tune, infer, eval")
     if "experiment" in value:
-        _check_mapping(value["experiment"], EXPERIMENT_FIELDS, "experiment", partial)
+        _check_mapping(value["experiment"], EXPERIMENT_FIELDS, "experiment", partial,
+                       optional=("transfer_source_experiment_id", "logs_root"))
     for stage in STAGES:
         if stage not in value:
             continue
@@ -209,6 +211,20 @@ def validate_config(value, partial=False):
     experiment = value["experiment"]
     if experiment["setting"] == "zero_shot" and "tune" in experiment["enabled_stages"]:
         _fail("experiment.enabled_stages", "zero_shot cannot enable tune")
+    source_id = experiment.get("transfer_source_experiment_id")
+    if source_id is not None and experiment["setting"] != "transfer_round2":
+        _fail("experiment.transfer_source_experiment_id",
+              "is supported only for transfer_round2")
+    if experiment["setting"] == "transfer_round2":
+        if source_id is not None and "tune" in experiment["enabled_stages"]:
+            _fail("experiment.enabled_stages",
+                  "transfer_round2 with a source experiment cannot enable tune")
+        if source_id is not None and "infer" not in experiment["enabled_stages"]:
+            _fail("experiment.enabled_stages",
+                  "transfer_round2 with a source experiment requires infer")
+        if source_id is None and "tune" not in experiment["enabled_stages"]:
+            _fail("experiment.transfer_source_experiment_id",
+                  "is required when transfer_round2 disables tune")
     for stage in STAGES:
         params, run = value[stage]["params"], value[stage]["run"]
         if run["max_parallel_jobs"] > len(run["gpu_groups"]):
@@ -302,11 +318,14 @@ def load_config(setting_path, default_path=DEFAULT_CONFIG, cli_overrides=None):
     return make_snapshot(config, [default_source, setting_source], {"cli": cli})
 
 
-def resolve_job_config(snapshot, stage, job_id, job_override=None, cli_override=None):
+def resolve_job_config(snapshot, stage, job_id, job_override=None, cli_override=None,
+                       *, allow_disabled=False):
     """Resolve a low-level job without allowing data/model lineage to be overridden."""
     validate_snapshot(snapshot)
     require_id(job_id)
-    if stage not in STAGES or stage not in snapshot["config"]["experiment"]["enabled_stages"]:
+    if (stage not in STAGES
+            or (stage not in snapshot["config"]["experiment"]["enabled_stages"]
+                and not allow_disabled)):
         raise ConfigError("Stage is not enabled: {}".format(stage))
     config = deepcopy(snapshot["config"])
     configured = config[stage]["jobs"].get(job_id, {})

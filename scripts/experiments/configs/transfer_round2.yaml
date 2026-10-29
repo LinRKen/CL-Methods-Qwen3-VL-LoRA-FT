@@ -2,3 +2,6 @@
 experiment:
   name: transfer-round2
   setting: transfer_round2
+  enabled_stages: [infer, eval]
+  # Supply the completed transfer_round1 experiment with:
+  # --set experiment.transfer_source_experiment_id=<experiment-id>

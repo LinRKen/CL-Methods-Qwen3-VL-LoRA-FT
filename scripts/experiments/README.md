@@ -2,6 +2,18 @@
 
 本目录实现实验配置、计划、运行记录、产物清单，低级 LoRA tune、Adapter/base infer 和批量 Qwen 柔性 eval 执行器，以及高级 tune、infer 和 eval 编排与结果汇总。YAML 中的参数为待最终核对的初始值。
 
+## 环境与目录
+
+`configs/default.yaml` 中每个阶段的 `run.python` 指定该阶段低级 worker 使用的解释器；setting YAML 未覆盖时继承默认值。高级编排 CLI 负责调度，不加载模型；实际训练、推理和 judge worker 分别使用下表对应环境。
+
+| 阶段 | 默认解释器 | 环境 |
+| --- | --- | --- |
+| tune | `/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python` | `Qwen3VL-LoRA-FT` |
+| infer | `/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python` | `Qwen3VL-vLLM` |
+| eval | `/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python` | `Qwen3VL-vLLM` |
+
+实验记录、infer 输出和 eval 输出共用 `/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT`；训练 payload 单独保存在 `/home/linruikang/data/checkpoints/SFT/CL-Methods/Qwen3-VL/LoRA-FT`。setting YAML 省略这些值时继承 `configs/default.yaml`。
+
 ## 文件组织
 
 - `configs/default.yaml`：共用默认参数。
@@ -46,7 +58,9 @@ infer:
         batch_size: 2
 ~~~
 
-每个 experiment、stage run 和 job 保存有效配置快照及配置指纹；experiment 快照记录默认/setting 文件的绝对路径与 SHA-256。恢复读取已有快照，不重新加载后来修改的默认 YAML。
+每个 experiment、stage run 和 job 保存有效配置快照及配置指纹；experiment 快照记录默认/setting 文件的绝对路径与 SHA-256。恢复读取已有快照，不重新加载后来修改的默认 YAML。GPU 分组、并发数和解释器等资源配置随计划冻结，执行时不动态调整。
+
+`tune.params.model_max_length` 默认值为 8192，但当前 flatten 训练数据路径没有实现截断；该值不会把超长样本裁剪到 8192 token。
 
 run.gpu_groups 只能显式使用物理 GPU 1–3，各组不得重叠；物理 GPU 0 禁止使用。该配置约束不替代后续执行器对实际设备身份的检查。
 
@@ -75,7 +89,14 @@ depends_on 仅表示同一高级 run 内的 job 执行先后；requires 描述�
 
 ## 记录与产物
 
-记录写入 experiment.records_root/<experiment_id>/，主要结构：
+记录写入 `experiment.records_root/<experiment_id>/`。默认 `records_root`、`infer_root`、`eval_root` 均为 `/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT`，可在 YAML 中配置。失败记录、错误详情和高级编排日志使用同一记录根目录：
+
+- 每次高级调用在 `stage-runs/<stage>/<run_id>/orchestrations/<invocation-id>/` 下保存 `execution.json`、各低级入口的 `<job-id>.log` 和 `summary.json`。
+- run 根目录保存最新的 `<stage>-summary.json`；job 记录与 payload 的 `execution.json` 保留低级退出状态及错误详情。
+- 低级详细日志分别位于对应 payload 的 `logs/train.log`、`logs/infer.log` 和 `logs/eval.log`。
+- worker 进入执行后的失败还可能留下 `inference_failure.json` 或 `evaluation_failure.json`；若在 invocation 建立前的配置或路径校验中失败，可能只有终端错误，没有持久化 invocation 日志。
+
+默认 `fail_fast: true` 时，高级 tune/infer 在首个 job 失败后停止派发、请求活动 job 清理并以非零状态退出；eval 的唯一 judge job 失败时也以非零状态退出。目录结构如下：
 
 ~~~text
 <experiment_id>/
@@ -92,7 +113,7 @@ depends_on 仅表示同一高级 run 内的 job 执行先后；requires 描述�
       artifacts/<role>.json
 ~~~
 
-实际 payload 按 <stage 对应根目录>/<experiment_id>/<run_id>/<job_id>/ 隔离，分别使用 checkpoints_root、infer_root 和 eval_root。prepare 只建立记录，不创建模型 payload 或复制权重。
+实际 payload 按 <stage 对应根目录>/<experiment_id>/<run_id>/<job_id>/ 隔离，分别使用 checkpoints_root、infer_root 和 eval_root。默认情况下，tune payload 写入 `/home/linruikang/data/checkpoints/SFT/CL-Methods/Qwen3-VL/LoRA-FT/<experiment_id>/<run_id>/<job_id>/`；infer/eval payload 和 experiment 记录写入共同的 results 根目录。prepare 只建立记录，不创建模型 payload 或复制权重。
 
 manifest 保存精确文件/目录、文件大小、完整 SHA-256 和来源：内部产物指定 producer，外部输入指定 external_source，二者必须且只能有一个。目录按全部文件记录内容；内部目录软链接不支持。相同 payload 的 manifest 可以复用，不需要复制模型。
 
@@ -111,23 +132,33 @@ python scripts/experiments/pipeline.py prepare --config scripts/experiments/conf
 plan 只打印 JSON 计划；prepare 创建记录但不执行模型。可使用 --default 指定其他默认 YAML，使用 --set infer.params.batch_size=2 等点号参数临时覆盖。run_tune_job.py 接受准备好的 job 目录和冻结 gpu_groups 的零起始索引。例如：
 
 ~~~bash
-python scripts/experiments/run_tune_job.py --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion --gpu-group-index 0
+python scripts/experiments/run_tune_job.py --job-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion --gpu-group-index 0
 ~~~
 
 未绑定内部依赖时，从成功 producer job 的 adapter manifest 显式传入，参数格式为 `--input <role>=<绝对 manifest 路径>`。例如：
 
 ~~~bash
 python scripts/experiments/run_tune_job.py \
-  --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-02-hypo \
+  --job-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-02-hypo \
   --gpu-group-index 0 \
-  --input parent-motion=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion/artifacts/adapter.json
+  --input parent-motion=/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion/artifacts/adapter.json
 ~~~
 
 恢复同一训练任务的中断状态时，给新的 planned job 显式传入失败/取消 attempt 已登记的 `artifacts/checkpoint-<step>.json`，并加 `--resume-training-state`。如果冻结计划还要求父 adapter，也要按其 adapter manifest 一并传入；checkpoint 提供模型权重和训练状态，父 adapter 用于验证 lineage。恢复要求训练 task、有效 job 配置、数据/模型输入指纹、父 adapter payload、DeepSpeed 配置和 GPU world size 与原 attempt 一致。不会搜索 latest checkpoint，也不会覆盖失败 attempt 的输出。终态 job 不能重新启动；低级入口不会重启终态 job，也不自动生成 retry 记录；恢复所需的新 planned job 记录由后续编排层负责创建。
 
 base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，W&B 监控只筛选同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
 
-每个低级输出目录包含 `checkpoints/`（训练 checkpoint 与 training_result.json）、`adapter/`（最终可复用 LoRA adapter 和 processor）、`logs/`（训练日志及 W&B 文件）及执行收据 `execution.json`。完成后 adapter、完整训练 checkpoint 和 summary manifest 会登记到 job 的 artifacts/；失败或中断时，执行器会尝试保留已完整写入的 checkpoint manifest，作为显式恢复来源。低级执行器只将父高级 run 推进为 running，完成/失败的汇总由高级调度器处理。一次低级命令只运行一个 job。
+每个训练 job 的 payload 路径为 `<checkpoints_root>/<experiment_id>/<run_id>/<job_id>/`，包含 `checkpoints/`、`adapter/`、`logs/` 和执行收据 `execution.json`。
+
+- `adapter/`：最终可复用的语言模型 LoRA 参数、PEFT 配置及 processor，不包含完整 base model；视觉编码器保持冻结。跨 task 只继承 adapter 权重，重置 optimizer、scheduler、epoch 和 global step。
+- `checkpoints/checkpoint-<global_step>/`：用于同一训练 task 显式恢复的训练 checkpoint，保留恢复所需的权重和训练状态。默认 `save_strategy: epoch`，每个 epoch 保存一次，`save_total_limit: 3`；目录名使用 global step，而不是 epoch 编号。
+- `checkpoints/training_result.json`：最终 step、样本数和训练结果。
+
+adapter、checkpoint 和 summary manifest 登记在 job 记录树的 `artifacts/`；失败或中断时，执行器会尝试保留已完整写入的 checkpoint manifest。
+
+job ID 来自冻结计划。未显式提供 experiment ID 时，系统按 `<experiment.name>-<UTC时间戳>-<8位随机后缀>` 生成；stage run ID 使用 stage 前缀和同类时间戳/后缀，时间戳格式为 `YYYYmmddTHHMMSSZ`。
+
+低级执行器只将父高级 run 推进为 running，完成/失败的汇总由高级调度器处理。一次低级命令只运行一个 job。
 
 ## 低级 Adapter/base infer 入口
 
@@ -136,7 +167,7 @@ run_infer_job.py 只执行一个已经 prepare 的冻结 infer job。一个 job 
 以下示例只说明用法，本轮未执行；工作目录为仓库根目录：
 
 ~~~bash
-/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_infer_job.py --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-whole --gpu-group-index 0 --input adapter=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<tune-run-id>/jobs/tune-whole/artifacts/adapter.json
+/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python scripts/experiments/run_infer_job.py --job-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-whole --gpu-group-index 0 --input adapter=/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<tune-run-id>/jobs/tune-whole/artifacts/adapter.json
 ~~~
 
 Zero-shot 使用其 infer-base job 目录，不传 adapter。--input ROLE=/绝对路径/manifest.json 可按角色重复；已经绑定 inputs 的 job 不接受再次传入替换。adapter 必须来自同一 experiment 内冻结 requires 指定的 tune job，且 producer 已成功、manifest 已登记、slot/task、base 指纹、训练配置及 lineage 一致。不会将 adapter 合并进 base 或叠加多个 adapter。
@@ -170,10 +201,10 @@ run_eval_job.py 执行已经 prepare 的单个 eval-judge-all 冻结 job。该 j
 以下仅为命令格式示例，本轮未执行。必须补齐该冻结 job 全部 scoring_pairs 对应的 --input，单独传入此处展示的一个 prediction 不能启动六 task 的完整评测：
 
 ~~~bash
-/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_eval_job.py \
-  --job-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>/jobs/eval-judge-all \
+/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python scripts/experiments/run_eval_job.py \
+  --job-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>/jobs/eval-judge-all \
   --gpu-group-index 0 \
-  --input prediction-motion=/home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-base/artifacts/prediction-motion.json
+  --input prediction-motion=/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>/jobs/infer-base/artifacts/prediction-motion.json
 ~~~
 
 worker 先对全部预测与精确 GT 做全量条数、顺序、ID、元信息和 prompt 预检，再创建共享 judge engine。不重新生成答案，不读媒体，不按样本数隐式截取，不增加基于正则的答案匹配。沿用 evaluation/COSINE 的既有 prompt 与计分：MCQ/OPEN 交由 Qwen 语义判断；MRA 由 Qwen 抽取数值后计算既有相对准确率；invalid 和解析失败计 0 且保留在分母。超长 judge prompt 按既有行为报错，不静默截断。
@@ -202,7 +233,7 @@ evaluation_result.json
 先通过 pipeline.py prepare 或高级 tune 入口创建实验记录。训练型 setting 完成同一 experiment 的高级 tune run 后，独立启动其 infer run；Zero-shot 直接使用 prepare 创建的 infer run。高级入口只接受既有冻结 run，不重新读取当前 YAML、不创建新实验，也不自动启动 tune/eval。例如（仅提供用法，本轮未执行）：
 
 ~~~bash
-/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_infer.py --run-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>
+/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python scripts/experiments/run_infer.py --run-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/infer/<infer-run-id>
 ~~~
 
 高级进程不加载模型；每个 Adapter/base 只启动一个 run_infer_job.py，在一个 vLLM engine 中完成该 job 全部 task。Zero-shot 一个 base job 测六 task；Multitask 一个 whole adapter job 测六 task；Singletask 六个 adapter 分别测对应 task；CL 按冻结训练顺序派发六个 adapter，各测六 task，合计 36 份预测。两种 Transfer 各使用三十个第二轮 adapter；round1 测第一轮 source task，round2 测第二轮 target task。全部测试 task 都使用完整 test 标注。
@@ -225,7 +256,7 @@ evaluation_result.json
 完成同一 experiment 的 infer run 后，使用已 prepare 的冻结 eval run 目录启动评测。入口只接受绝对路径，不重新读取当前 YAML、不创建新实验，不自动执行训练或推理。例如（仅说明用法，本轮未执行）：
 
 ~~~bash
-/home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_eval.py --run-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>
+/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python scripts/experiments/run_eval.py --run-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/eval/<eval-run-id>
 ~~~
 
 高级入口核对 experiment/run/job 的冻结配置、计划和登记关系，要求同一 experiment 唯一的 infer run 已成功；按 scoring_pairs 顺序绑定对应成功 infer job 的 prediction manifest，复核 producer、slot、task、内容指纹及推理时使用的精确 test GT。缺失、重复、跨实验、错位或被修改的预测会被拒绝，不搜索其他结果作为替代。
@@ -277,7 +308,7 @@ SIGINT/SIGTERM 请求低级入口清理其 worker 并等待退出；高级层不
 
 ~~~bash
 /home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python scripts/experiments/run_tune.py \
-  --run-dir /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>
+  --run-dir /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>
 ~~~
 
 `--run-dir` 不接受 `--config`、`--default`、`--set` 或 `--experiment-id`，只读取冻结记录。接管要求高级 run 仍为 planned/running，所有 job 为未执行的 planned 或已成功的 succeeded；已成功 job 的 adapter 内容和来源通过 manifest 复核后跳过。已有 execution.json/输出的 planned job、running job 或 failed/cancelled job 会被拒绝，需先人工审查。不要同时用低级入口启动同一 run 的任务。高级入口不重置终态、不自动重试、不寻找最新 checkpoint；显式恢复仍使用低级入口绑定 checkpoint 后执行，成功后高级入口可以接管其余 planned jobs。
@@ -297,7 +328,7 @@ SIGINT/SIGTERM 请求低级入口清理其 worker 并等待退出；高级层不
 
 ## Transfer 两轮迁移高级 tune
 
-Transfer-round1 和 Transfer-round2 使用相同的训练结构：第一轮在 motion、hypo、pattern、nav、view、geo 上分别从 base model 新建 LoRA，共六个独立 job；第二轮将每个第一轮 adapter 分别迁移到另外五个 task，共三十个独立 job。每个高级 tune run 合计 36 个低级训练 job。
+Transfer-round1 和 Transfer-round2 使用相同的训练结构：第一轮在 motion、hypo、pattern、nav、view、geo 上分别从 base model 新建 LoRA，共六个独立 job；第二轮将每个第一轮 adapter 分别迁移到另外五个 task，共三十个独立 job。每个高级 tune run 合计 36 个低级训练 job。两种 setting 的训练图相同，但当前产物引用必须来自同一 experiment。在 Transfer-round1 与 Transfer-round2 两个 experiment 之间自动复用同一组 36 个训练产物尚未实现；分别创建两个 Transfer experiment 会各自安排训练。
 
 - 第一轮 job：`tune-round1-<task>`，输出 slot 为 `round1-<task>`。
 - 第二轮 job：`tune-round2-<source>-to-<target>`，其中 source 与 target 不同，训练 target/train，输出 slot 为 `round2-<source>-to-<target>`。

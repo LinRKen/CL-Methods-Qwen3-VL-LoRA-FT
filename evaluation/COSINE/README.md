@@ -1,6 +1,6 @@
 # COSINE Qwen 柔性评测
 
-读取已有 COSINE infer JSONL 和注册测试集 GT，用本地 Qwen3-VL 作纯文本 judge。本轮只写代码，未运行验证或评测；默认参数和显存需求未经验证。
+读取已有 COSINE infer JSONL 和注册测试集 GT，用本地 Qwen3-VL 作纯文本 judge。该脚本是独立的单次评测入口；批量实验评测请使用 `scripts/experiments/run_eval.py`，其记录、资源调度和汇总规则见[实验编排说明](../../scripts/experiments/README.md)。
 
 ## 文件与输入
 
@@ -35,7 +35,7 @@
 | 生成 | greedy（temperature=0、top_p=1、n=1），seed=42 |
 | JSON 格式修复 | 1 次 |
 
-需已有 vLLM >= 0.11.0 和支持 Qwen3-VL 的 Transformers 环境；脚本用当前 Python，可设 `EVAL_PYTHON` 指定解释器。权重必须本地可读，离线加载，不下载模型、不修改环境。默认模型 4B；参考实现用 8B，跨模型结果属于不同评测配置。
+脚本默认使用 `/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python`（`Qwen3VL-vLLM` 环境），也可用 `EVAL_PYTHON` 显式指定解释器。环境需有 vLLM >= 0.11.0 和支持 Qwen3-VL 的 Transformers；权重必须本地可读，离线加载，不下载模型、不修改环境。默认模型 4B；参考实现用 8B，跨模型结果属于不同评测配置。
 
 Python 入口检查 GPU 后才导入 Transformers/vLLM：必须显式选择物理 GPU 1–3 或完整 UUID；核对 nvidia-smi 身份与 PCI 序，并将物理设备限制传递给 worker。GPU 0 永远禁止，失败则停止，不自动回退。tensor parallel 数必须等于所选卡数。对已完整的 resume 仅重建汇总时不启动 GPU。
 
@@ -44,7 +44,7 @@ Python 入口检查 GPU 后才导入 Transformers/vLLM：必须显式选择物�
 ```bash
 cd /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT
 GPU_IDS=1 INPUT_FILE=/absolute/path/to/motion.jsonl \
-OUTPUT_DIR=/home/linruikang/data/eval-results/COSINE/motion/run-001 \
+OUTPUT_DIR=/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/legacy-eval/COSINE/cosine_motion_test/run-001 \
 bash evaluation/COSINE/eval_cosine.sh
 ```
 
@@ -53,7 +53,7 @@ bash evaluation/COSINE/eval_cosine.sh
 
 ## 结果与续跑
 
-默认输出放仓库外 `/home/linruikang/data/eval-results/COSINE/<dataset>/<timestamp>`。
+默认输出放在 `/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/legacy-eval/COSINE/<dataset>/<timestamp>`。目录名使用 dataset 名和启动时间戳；此独立入口的结果与高级 pipeline 的 `<experiment_id>/<run_id>/<job_id>/` 目录分开。
 
 - `judge.raw.jsonl`：完整输入、所有 judge 对话/回复、解析情况、运行配置和物理 GPU 身份；逐条 flush/fsync，可作为续跑依据。
 - `judge.scored.jsonl`：全量完成后原子写入的逐样本排序结果。

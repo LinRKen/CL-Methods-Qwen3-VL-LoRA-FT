@@ -7,10 +7,12 @@ from pathlib import Path
 import signal
 import subprocess
 import time
+import traceback
 
 from .artifacts import check_manifest
-from .common import TASKS, new_id, read_json, utc_now, write_json_atomic
+from .common import TASKS, read_json, utc_now, write_json_atomic
 from .config import resolve_job_config
+from .orchestration_logging import run_logged
 from .records import (
     load_experiment, load_job, load_stage_run, record_status, update_status,
 )
@@ -277,7 +279,7 @@ def _prepare_launch(info, jobs):
             info["input_manifests"][parent["input_role"]] = parent["manifest"]
 
 
-def _successful_adapter(job_dir, job):
+def _successful_adapter(job_dir, job, *, verify_contents=True):
     if job["status"] != "succeeded":
         raise ValueError("Job has not succeeded: " + job["job_id"])
     outputs = [item for item in job["artifacts"] if item["kind"] == "adapter"]
@@ -287,7 +289,7 @@ def _successful_adapter(job_dir, job):
     if artifact["path"] != "artifacts/" + artifact["role"] + ".json":
         raise ValueError("Adapter manifest path does not match its registered role")
     manifest_path = job_dir / artifact["path"]
-    manifest = check_manifest(read_json(manifest_path), verify_contents=True)
+    manifest = check_manifest(read_json(manifest_path), verify_contents=verify_contents)
     if (manifest["kind"] != "adapter" or manifest["fingerprint"] != artifact["fingerprint"]
             or manifest["requested_path"] != str(Path(job["output_dir"]) / "adapter")
             or manifest["path"] != str((Path(job["output_dir"]) / "adapter").resolve(strict=True))
@@ -483,6 +485,10 @@ def _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receip
 
 def execute_tune_run(run_dir):
     """Schedule frozen tune dependencies with resource and failure handling."""
+    return run_logged("tune", run_dir, _execute_tune_run)
+
+
+def _execute_tune_run(run_dir, invocation_dir):
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
     with _run_lock(run_dir), _signals() as signals:
         run_dir, run, snapshot, setting, jobs = _context(run_dir)
@@ -495,8 +501,6 @@ def execute_tune_run(run_dir):
         if not low_level.is_file():
             raise ValueError("Low-level tune entry point is missing: {}".format(low_level))
         started_at = utc_now()
-        invocation_dir = run_dir / "orchestrations" / new_id("tune")
-        invocation_dir.mkdir(parents=True, exist_ok=False)
         receipt = {"schema_version": 1, "run_id": run["run_id"], "experiment_id": run["experiment_id"],
                    "config_fingerprint": run["config_fingerprint"], "started_at": started_at,
                    "pid": os.getpid(), "status": "running", "max_parallel_jobs": capacity,
@@ -542,6 +546,8 @@ def execute_tune_run(run_dir):
                             _mark(info["directory"], "cancelled", message + "; job was not launched")
                             failures.append({"job_id": job_id, "blocked_by": blocked, "message": message})
                             pending.remove(job_id)
+                            if fail_fast:
+                                break
                             continue
                         if any(parent in pending or parent in active or "adapter" not in jobs[parent]
                                for parent in info["depends_on"]):
@@ -557,7 +563,8 @@ def execute_tune_run(run_dir):
                         except (OSError, ValueError, KeyError) as error:
                             pending.remove(job_id)
                             _mark(info["directory"], "failed", "Cannot launch low-level executor: {}".format(error))
-                            failures.append({"job_id": job_id, "message": str(error)})
+                            failures.append({"job_id": job_id, "message": str(error),
+                                             "traceback": traceback.format_exc()})
                             write_json_atomic(invocation_dir / "execution.json", receipt)
                             if fail_fast:
                                 break
@@ -580,7 +587,8 @@ def execute_tune_run(run_dir):
             _cancel(pending, active, jobs, failures, "High-level tune run interrupted")
         except BaseException as error:
             _cancel(pending, active, jobs, failures, "Scheduler stopped: {}".format(error))
-            failures.append({"message": "{}: {}".format(type(error).__name__, error)})
+            failures.append({"message": "{}: {}".format(type(error).__name__, error),
+                             "traceback": traceback.format_exc()})
 
         child_statuses = [record_status(info["directory"])["status"] for info in jobs.values()]
         final_status = ("cancelled" if interrupted else

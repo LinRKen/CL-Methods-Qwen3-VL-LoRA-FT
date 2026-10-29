@@ -11,21 +11,27 @@ from pathlib import Path
 if __package__ in (None, ""):
     from lib.common import SCHEMA_VERSION, STAGES, TASKS, require_id, write_json_atomic
     from lib.config import (
-        ConfigError, dotted_overrides, load_config, resolve_job_config, validate_snapshot,
+        ConfigError, dotted_overrides, load_config, make_snapshot, resolve_job_config, validate_snapshot,
     )
     from lib.records import create_experiment, create_job, create_stage_run
+    from lib.orchestration_logging import record_preparation_failure
+    from lib.transfer import validate_transfer_source
 else:
     from .lib.common import SCHEMA_VERSION, STAGES, TASKS, require_id, write_json_atomic
     from .lib.config import (
-        ConfigError, dotted_overrides, load_config, resolve_job_config, validate_snapshot,
+        ConfigError, dotted_overrides, load_config, make_snapshot, resolve_job_config, validate_snapshot,
     )
     from .lib.records import create_experiment, create_job, create_stage_run
+    from .lib.orchestration_logging import record_preparation_failure
+    from .lib.transfer import validate_transfer_source
 
 WHOLE_TASK = "whole"
 
 
-def _artifact_ref(stage, job_id, artifact_kind, *, slot=None, task=None):
+def _artifact_ref(stage, job_id, artifact_kind, *, slot=None, task=None, experiment_id=None):
     reference = {"stage": stage, "job_id": require_id(job_id), "artifact_kind": artifact_kind}
+    if experiment_id is not None:
+        reference["experiment_id"] = require_id(experiment_id)
     if slot is not None:
         reference["slot"] = require_id(slot)
     if task is not None:
@@ -209,6 +215,8 @@ def _infer_jobs(config):
         }, output={"artifact_kind": "prediction", "slot": task}) for task in TASKS]
     if setting in ("transfer_round1", "transfer_round2"):
         jobs = []
+        source_experiment_id = (experiment.get("transfer_source_experiment_id")
+                                if setting == "transfer_round2" else None)
         for source in TASKS:
             for target in TASKS:
                 if target == source:
@@ -220,14 +228,18 @@ def _infer_jobs(config):
                     "infer-{}".format(slot),
                     tasks=[test_task],
                     input_specs=_infer_input_specs(experiment, [test_task]),
-                    requires=[_artifact_ref("tune", adapter_job, "adapter", slot=slot)],
-                    lineage={
+                    requires=[_artifact_ref(
+                        "tune", adapter_job, "adapter", slot=slot,
+                        **({"experiment_id": source_experiment_id}
+                           if source_experiment_id is not None else {}))],
+                    lineage=dict({
                         "adapter_ref": adapter_job,
                         "source_task": source,
                         "second_round_task": target,
                         "test_tasks": [test_task],
                         "model_loads_per_job": 1,
-                    },
+                    }, **({"adapter_source_experiment_id": source_experiment_id}
+                          if source_experiment_id is not None else {})),
                     output={"artifact_kind": "prediction", "slot": slot},
                 ))
         return jobs
@@ -308,6 +320,12 @@ def build_plan(snapshot):
 def prepare_records(snapshot, experiment_id=None):
     """Materialize a configuration and its plans as records; launch no workloads."""
     validate_snapshot(snapshot)
+    source_context = validate_transfer_source(snapshot, experiment_id, audit_adapters=True)
+    if source_context is not None:
+        snapshot = make_snapshot(
+            snapshot["config"], snapshot["sources"],
+            {**snapshot["layers"], "transfer_source": source_context["binding"]},
+        )
     plan = build_plan(snapshot)
     experiment_dir = create_experiment(snapshot, experiment_id=experiment_id)
     write_json_atomic(experiment_dir / "plan.json", plan)
@@ -350,7 +368,11 @@ def main(argv=None):
     if args.command == "plan":
         print(json.dumps(build_plan(snapshot), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
-    experiment_dir = prepare_records(snapshot, experiment_id=args.experiment_id)
+    try:
+        experiment_dir = prepare_records(snapshot, experiment_id=args.experiment_id)
+    except BaseException as error:
+        record_preparation_failure("prepare", snapshot, error)
+        raise
     print(str(experiment_dir))
     return 0
 

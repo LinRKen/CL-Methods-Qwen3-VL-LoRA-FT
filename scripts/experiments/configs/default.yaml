@@ -11,10 +11,11 @@ experiment:
   base_model: /home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct
   processor_path: /home/linruikang/data/checkpoints/Qwen3-VL-4B-Instruct
   judge_model: /home/linruikang/data/checkpoints/Qwen3-VL-8B-Instruct
-  records_root: /home/linruikang/data/experiment-runs/Qwen3VL-LoRA-FT
-  checkpoints_root: /home/linruikang/data/checkpoints/SFT/Qwen3VL-LoRA-FT
-  infer_root: /home/linruikang/data/infer-results/Qwen3VL-LoRA-FT
-  eval_root: /home/linruikang/data/eval-results/Qwen3VL-LoRA-FT
+  records_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT
+  logs_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT  # 高级编排日志及错误记录
+  checkpoints_root: /home/linruikang/data/checkpoints/SFT/CL-Methods/Qwen3-VL/LoRA-FT
+  infer_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT
+  eval_root: /home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT
 
 tune:
   params:
@@ -29,7 +30,7 @@ tune:
     optim: adamw_torch
     bf16: true
     fp16: false
-    model_max_length: 8192
+    model_max_length: 8192  # flatten 训练路径当前未实现按此参数截断
     gradient_checkpointing: true
     dataloader_num_workers: 4
     logging_steps: 1
@@ -80,7 +81,7 @@ infer:
     do_sample: false
     temperature: 0.7
     top_p: 0.9
-    seed: 0
+    seed: 42
     min_pixels: 784
     max_pixels: 50176
     video_min_frames: 4
@@ -89,7 +90,7 @@ infer:
     video_max_pixels: 802816
     video_fps: 2
   run:
-    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM/bin/python
     gpu_groups: [[1]]
     max_parallel_jobs: 1
     fail_fast: true
@@ -106,7 +107,7 @@ eval:
     repair_attempts: 1
     seed: 42
   run:
-    python: /home/linruikang/data/envs/Qwen3VL-vLLM-Verify-20261025/bin/python
+    python: /home/linruikang/data/envs/Qwen3VL-vLLM/bin/python
     gpu_groups: [[1]]
     max_parallel_jobs: 1
     fail_fast: true

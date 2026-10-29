@@ -65,13 +65,15 @@ def _job_fields(task, tasks, depends_on, requires, input_specs, lineage, output)
     if not isinstance(requires, list):
         raise ValueError("requires must list logical artifact references")
     for reference in requires:
-        fields = {"stage", "job_id", "artifact_kind", "slot", "task"}
+        fields = {"experiment_id", "stage", "job_id", "artifact_kind", "slot", "task"}
         if (not isinstance(reference, dict) or set(reference) - fields
                 or not {"stage", "job_id", "artifact_kind"}.issubset(reference)):
             raise ValueError("Malformed logical artifact reference")
         if reference["stage"] not in STAGE_OUTPUT_ROOTS or reference["artifact_kind"] not in ARTIFACT_KINDS:
             raise ValueError("Unknown referenced stage or artifact kind")
         require_id(reference["job_id"])
+        if "experiment_id" in reference:
+            require_id(reference["experiment_id"])
         if "slot" in reference:
             require_id(reference["slot"])
         if "task" in reference and reference["task"] not in TASKS:
@@ -136,8 +138,9 @@ def _validate_input_specs(specs, inputs):
 
 def _validate_required_inputs(requires, inputs, experiment_id):
     for reference in requires:
+        expected_experiment = reference.get("experiment_id", experiment_id)
         if not any(_manifest_matches(reference, manifest)
-                   and manifest["producer"].get("experiment_id") == experiment_id
+                   and manifest["producer"].get("experiment_id") == expected_experiment
                    for manifest in inputs.values()):
             raise ValueError("Required artifact is not explicitly bound: {}".format(reference))
 
