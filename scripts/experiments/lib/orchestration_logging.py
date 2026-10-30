@@ -8,7 +8,7 @@ import sys
 import traceback
 
 from .common import new_id, utc_now, write_json_atomic
-from .records import load_stage_run
+from .records import load_stage_run, load_stage_run_metadata
 
 
 class _Tee:
@@ -70,14 +70,17 @@ def _finish(directory, receipt, status, *, failure=None):
 def run_logged(stage, run_dir, execute):
     """Create logs before business preflight, without changing frozen resources."""
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
-    run, snapshot = load_stage_run(run_dir)
-    if run["stage"] != stage:
-        raise ValueError("--run-dir must identify a registered {} stage run".format(stage))
+    run, snapshot = load_stage_run_metadata(run_dir)
     directory, receipt = _new_invocation(stage, snapshot, run=run, run_dir=run_dir)
     with (directory / "orchestrator.log").open("x", encoding="utf-8", buffering=1) as log:
         with redirect_stdout(_Tee(sys.stdout, log)), redirect_stderr(_Tee(sys.stderr, log)):
             print("Orchestration logs: {}".format(directory), flush=True)
             try:
+                validated_run, validated_snapshot = load_stage_run(run_dir)
+                if validated_run != run or validated_snapshot != snapshot:
+                    raise RuntimeError("Stage-run metadata changed while initializing orchestration logging")
+                if validated_run["stage"] != stage:
+                    raise ValueError("--run-dir must identify a registered {} stage run".format(stage))
                 result = execute(run_dir, directory)
             except BaseException as error:
                 status = "cancelled" if isinstance(error, (KeyboardInterrupt, InterruptedError)) else "failed"

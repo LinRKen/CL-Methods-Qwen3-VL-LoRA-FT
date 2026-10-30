@@ -266,10 +266,17 @@ def _load_planned_jobs(directory, record):
     return planned_jobs
 
 
-def load_stage_run(directory):
+def load_stage_run_metadata(directory):
+    """Load a stage-run record and its snapshot before validating its frozen plan."""
     directory = Path(directory).expanduser().resolve(strict=True)
     _, record = _read_record(directory, "run.json")
     snapshot = _load_snapshot(directory, record)
+    return record, snapshot
+
+
+def load_stage_run(directory):
+    directory = Path(directory).expanduser().resolve(strict=True)
+    record, snapshot = load_stage_run_metadata(directory)
     _load_planned_jobs(directory, record)
     return record, snapshot
 
