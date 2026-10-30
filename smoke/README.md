@@ -146,3 +146,11 @@ CPU 入口为 scripts/test_transfer_tune_orchestrator.py，另回归 scripts/tes
 新增 scripts/test_eval_orchestrator.py --result-root <尚不存在的 smoke/results 子目录>、scripts/run_eval_orchestrator_adoption.py 和 scripts/audit_eval_orchestrator.py。CPU 和接管入口设置 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0。接管 runner 专用于报告所列的既有 smoke 计划；--resume 续接原进程，不重跑已成功的高级 run。独立审计只读取已有结果，--report 必须指向该结果根下尚不存在的文件。
 
 证据为 results/eval-orchestrator-20261028-pYw7QiHv/。两份真实结果各 24 条，combined_flat_rawacc 为 24.58% 和 32.92%，仅用于核对历史汇总，原预测上限为 32 tokens 且存在截断，不代表正式效果。其他 setting 和故障路径由 CPU 模拟；本轮未覆盖新的真实 judge 初始化、全量或多卡。仅改 smoke，未提交；本轮已完成，不重复评测或自动开展 YAML 核对。
+
+## 高级编排预检失败日志修复验证
+
+2026-10-30 在 test/pipeline-automation 验证修复提交 4b744c0：七组 CPU 用例共 253 项全部通过，覆盖三阶段坏计划日志、初始化期间元数据/快照替换、真实高级 CLI 非零退出及既有编排回归。纯 CPU，未加载模型或使用 GPU。完整结果、审计边界和复现入口见 [PIPELINE_LOGGING_FIX_20261030.md](reports/PIPELINE_LOGGING_FIX_20261030.md)。
+
+新增 smoke/scripts/test_pipeline_logging_fix.py --result-root <全新目录>，默认执行三阶段日志定向用例；--test <方法名> 仅执行该方法的三个阶段版本。结果目录必须位于 smoke/results 下；所有 CPU 入口显式设置 CUDA_VISIBLE_DEVICES=、PYTHONDONTWRITEBYTECODE=1、GIT_OPTIONAL_LOCKS=0。基础夹具已隔离 logs_root。
+
+证据为 results/pipeline-logging-fix-20261030-094622-3670397/。本轮完成，未提交，不重复启动成功套件。范围基线是在首个 infer 回归启动后捕获，最终比较的证明范围见报告；不声称完整覆盖捕获之前的逐字节状态。

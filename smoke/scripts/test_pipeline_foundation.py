@@ -61,7 +61,7 @@ class FoundationTests(unittest.TestCase):
         document = yaml.safe_load((LIBROOT / 'configs' / (template + '.yaml')).read_text())
         roots = {key: str(self.case / key) for key in (
             'dataset_root', 'base_model', 'processor_path', 'judge_model', 'records_root',
-            'checkpoints_root', 'infer_root', 'eval_root')}
+            'checkpoints_root', 'infer_root', 'eval_root', 'logs_root')}
         document = deep_merge(document, {'experiment': roots})
         if patch:
             document = deep_merge(document, patch)
