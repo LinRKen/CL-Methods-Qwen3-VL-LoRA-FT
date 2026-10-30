@@ -51,7 +51,7 @@ smoke/
 3. 完整执行命令、运行目录和主要参数。
 4. 外部结果保存位置及对应的验证报告。
 
-训练环境路径为 `/home/linruikang/data/envs/Qwen3VL-LoRA-FT`；需要其他环境时，在相应测试说明和报告中记录实际使用的环境。创建本目录不代表环境或功能验证通过。
+训练环境为 `/home/linruikang/data/envs/Qwen3VL-LoRA-FT`（`Qwen3VL-LoRA-FT`），infer/eval 环境为 `/home/linruikang/data/envs/Qwen3VL-vLLM`（`Qwen3VL-vLLM`）。pipeline 低级 worker 的解释器由 `scripts/experiments/configs/default.yaml` 中对应 stage 的 `run.python` 指定；smoke 测试应记录实际使用的环境。创建本目录不代表环境或功能验证通过。
 
 ## 验证报告
 

@@ -1,0 +1,2 @@
+# Configuration tools only; model environments retain their own dependencies.
+PyYAML>=6.0,<7

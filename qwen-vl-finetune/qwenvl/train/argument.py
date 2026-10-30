@@ -6,6 +6,8 @@ from typing import Dict, Optional, Sequence, List
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="Qwen/Qwen2.5-VL-3B-Instruct")
+    processor_name_or_path: Optional[str] = field(default=None)
+    adapter_name_or_path: Optional[str] = field(default=None)
     tune_mm_llm: bool = field(default=False)
     tune_mm_mlp: bool = field(default=False)
     tune_mm_vision: bool = field(default=False)
@@ -13,6 +15,8 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_use: str = field(default="")
+    annotation_path: Optional[str] = field(default=None)
+    media_root: Optional[str] = field(default=None)
     data_flatten: bool = field(default=False)
     data_packing: bool = field(default=False)
     base_interval: int = field(default=2)
@@ -28,6 +32,8 @@ class DataArguments:
 @dataclass
 class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
+    resume_checkpoint_path: Optional[str] = field(default=None)
+    final_adapter_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
         default=512,
