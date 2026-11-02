@@ -23,16 +23,16 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-from qwenvl.train.wandb_utils import (
-    configure_wandb_gpu_monitoring,
-    prepare_training_gpu_selection,
-)
+from qwenvl.train.wandb_utils import prepare_training_gpu_selection
 
 # Resolve GPU identities before torch/Transformers can initialize CUDA.
 _training_gpu_selection = prepare_training_gpu_selection()
 
 import torch
 import transformers
+from transformers.integrations import WandbCallback
+
+from qwenvl.train.swanlab_utils import configure_swanlab_monitoring
 
 from trainer import replace_qwen2_vl_attention_class
 
@@ -107,7 +107,7 @@ def train(attn_implementation="flash_attention_2"):
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     local_rank = training_args.local_rank
-    configure_wandb_gpu_monitoring(training_args, _training_gpu_selection)
+    monitoring_callback = configure_swanlab_monitoring(training_args, _training_gpu_selection)
     resume = training_args.resume_checkpoint_path
     if resume is not None:
         resume_path = Path(resume)
@@ -241,6 +241,9 @@ def train(attn_implementation="flash_attention_2"):
     trainer = Trainer(
         model=model, processing_class=tokenizer, args=training_args, **data_module
     )
+    if monitoring_callback is not None:
+        trainer.remove_callback(WandbCallback)
+        trainer.add_callback(monitoring_callback)
 
     # None starts a new optimizer/scheduler/epoch/step even when adapter weights were loaded.
     result = trainer.train(resume_from_checkpoint=resume)
@@ -278,6 +281,8 @@ def train(attn_implementation="flash_attention_2"):
             json.dump(summary, handle, ensure_ascii=False, indent=2, allow_nan=False)
             handle.write("\n")
     trainer.accelerator.wait_for_everyone()
+    if monitoring_callback is not None and trainer.is_world_process_zero():
+        monitoring_callback.finish()
 
 
 if __name__ == "__main__":

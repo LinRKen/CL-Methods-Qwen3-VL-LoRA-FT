@@ -57,7 +57,7 @@ tune:
     save_strategy: epoch
     save_steps: 500
     save_total_limit: 3
-    report_to: wandb
+    report_to: wandb  # W&B compatibility API; logs are forwarded to SwanLab
     deepspeed: /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT/qwen-vl-finetune/scripts/zero3.json
   run:
     python: /home/linruikang/data/envs/Qwen3VL-LoRA-FT/bin/python
@@ -66,8 +66,8 @@ tune:
     fail_fast: true
     master_addr: 127.0.0.1
     master_port: 29501
-    wandb_project: Qwen3VL-LoRA-FT
-    wandb_mode: online
+    wandb_project: Qwen3VL-LoRA-FT  # Legacy key; used as the SwanLab project
+    wandb_mode: online  # Legacy key; SwanLab mode: online/offline/disabled
   jobs: {}
 
 infer:

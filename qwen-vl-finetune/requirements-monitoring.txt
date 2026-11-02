@@ -1,0 +1,4 @@
+# Training monitoring: W&B compatibility API, SwanLab backend, selected-card NVML metrics.
+swanlab==0.10.3
+wandb==0.31.0
+nvidia-ml-py==13.615.71

@@ -14,6 +14,28 @@
 
 实验记录、infer 输出和 eval 输出共用 `/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT`；训练 payload 单独保存在 `/home/linruikang/data/checkpoints/SFT/CL-Methods/Qwen3-VL/LoRA-FT`。setting YAML 省略这些值时继承 `configs/default.yaml`。
 
+## SwanLab 训练监控
+
+训练环境 `Qwen3VL-LoRA-FT` 安装 `qwen-vl-finetune/requirements-monitoring.txt` 并通过 `swanlab login` 登录。训练入口在首次 `wandb.init` 前调用官方 `swanlab.sync_wandb(wandb_run=False)`，保留 Transformers 的 W&B 兼容接口，将训练日志发到 SwanLab。infer/eval 环境不需要新增此依赖。
+
+现有 YAML 字段继续使用以下含义，setting/job/CLI 的继承和冻结规则不变：
+
+| 配置 | 迁移后的含义 |
+| --- | --- |
+| `tune.params.report_to: wandb` | 启用 W&B → SwanLab 兼容上报；`none` 跳过两者 |
+| `tune.run.wandb_project` | SwanLab 项目名 |
+| `tune.run.wandb_mode` | SwanLab 的 `online`、`offline` 或 `disabled` 模式 |
+| `tune.run.gpu_groups` | 同时决定训练和 GPU 指标采集范围，无需再传监控 GPU |
+| `tune.params.logging_steps` | GPU 指标随 Trainer 日志事件一起采样的频率 |
+
+执行器由冻结配置设置 `SWANLAB_MODE`，强制 W&B 自身为 `offline`；不会向 W&B 云端上传。每个低级 job 只在全局主进程建立一个新的 SwanLab run，名称为 `<experiment-id>/<run-id>/<job-id>`，group 为 experiment ID。SwanLab 使用新生成的 run ID；W&B 的本地兼容 ID 单独保留，显式恢复训练 checkpoint 也不会续接原监控历史。
+
+每个训练 payload 的 `logs/swanlab/` 保存 SwanLab 日志，`logs/wandb/` 保存 W&B 离线兼容文件，训练 stdout/stderr 仍在 `logs/train.log`。目录位于 `checkpoints_root/<experiment-id>/<tune-run-id>/<job-id>/` 下。`execution.json` 记录监控模式、日志路径和禁用原生探针的环境参数，不记录 API key 或登录凭据。直接运行旧训练入口时，可以用 `SWANLAB_MODE`、`SWANLAB_LOG_DIR` 指定模式和日志路径；pipeline 使用冻结 YAML 覆盖这些值。
+
+设备身份通过 NVML 按选定的物理编号或 UUID 解析，在导入 CUDA 前完成，并在 worker 再次核对。禁止物理 GPU 0，不枚举全部设备，不回退到其他卡。为避免 SwanLab 0.10.3 原生硬件探针枚举整机显卡，两套 SDK 的原生硬件采集均关闭；相应的自动 CPU/整机硬件图表也不再采集。
+
+自定义回调仅在主进程采集训练卡的显存占用/总量、GPU 利用率、功耗和温度，指标前缀为 `train/gpu/<物理编号>/`。显存单位为 MiB、功耗为 W、温度为 °C；显存和利用率是选定整卡的瞬时值，包含共享该卡的其他进程，不代表训练进程独占量或连续峰值。不支持的传感器只告警一次并跳过该指标，设备身份不符则报错；不会为补齐指标查询其他卡。
+
 ## 文件组织
 
 - `configs/default.yaml`：共用默认参数。
@@ -146,7 +168,7 @@ python scripts/experiments/run_tune_job.py \
 
 恢复同一训练任务的中断状态时，给新的 planned job 显式传入失败/取消 attempt 已登记的 `artifacts/checkpoint-<step>.json`，并加 `--resume-training-state`。如果冻结计划还要求父 adapter，也要按其 adapter manifest 一并传入；checkpoint 提供模型权重和训练状态，父 adapter 用于验证 lineage。恢复要求训练 task、有效 job 配置、数据/模型输入指纹、父 adapter payload、DeepSpeed 配置和 GPU world size 与原 attempt 一致。不会搜索 latest checkpoint，也不会覆盖失败 attempt 的输出。终态 job 不能重新启动；低级入口不会重启终态 job，也不自动生成 retry 记录；恢复所需的新 planned job 记录由后续编排层负责创建。
 
-base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，W&B 监控只筛选同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
+base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，SwanLab 回调只采集同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
 
 每个训练 job 的 payload 路径为 `<checkpoints_root>/<experiment_id>/<run_id>/<job_id>/`，包含 `checkpoints/`、`adapter/`、`logs/` 和执行收据 `execution.json`。
 
@@ -316,8 +338,8 @@ SIGINT/SIGTERM 请求低级入口清理其 worker 并等待退出；高级层不
 参数与资源分工：
 
 - 高级 run 的 `tune.run.max_parallel_jobs` 限制并发低级进程数；`tune.run.fail_fast` 决定失败策略。这两个调度参数以高级 run 的冻结值为准，job 局部覆盖不改变整个 run 的策略。
-- 每个 job 使用自身合并后的 `tune.params`，以及 `tune.run.python`、`gpu_groups`、`master_addr`、`master_port` 和 W&B 设置；高级 CLI 覆盖继续按原配置优先级生效。
-- 调度器从各 job 的有效 `gpu_groups` 选择空闲组，按物理 GPU 集与 `master_addr`/`master_port + group_index` 避免本 run 内的资源冲突；低级执行器继续持有 GPU、端口和阶段槽位锁。job 局部 GPU 分组不同时也按实际设备处理。物理 GPU 0 始终禁止，训练与 W&B 使用同一分组。
+- 每个 job 使用自身合并后的 `tune.params`，以及 `tune.run.python`、`gpu_groups`、`master_addr`、`master_port` 和 SwanLab 兼容监控设置；高级 CLI 覆盖继续按原配置优先级生效。
+- 调度器从各 job 的有效 `gpu_groups` 选择空闲组，按物理 GPU 集与 `master_addr`/`master_port + group_index` 避免本 run 内的资源冲突；低级执行器继续持有 GPU、端口和阶段槽位锁。job 局部 GPU 分组不同时也按实际设备处理。物理 GPU 0 始终禁止，训练与 SwanLab GPU 指标使用同一分组。
 - `max_parallel_jobs: 1` 或只有一组 GPU 时依次训练。独立任务或 Transfer 分支配置多组独立 GPU 并提高并发上限后可并行；CL 的任务依赖仍强制六阶段串行。单组可含多张 GPU，由低级执行器使用 torchrun。
 - `fail_fast: true` 在发现首个失败后停止派发，并请求其他活动低级进程退出、等待其关闭训练进程及登记已完整写出的 checkpoint；未启动任务标为 cancelled。`false` 继续其他独立任务，最后仍将有失败的高级 run 标为 failed；CL 后续阶段依赖前一阶段，Transfer 第二轮依赖各自的第一轮来源，即使关闭 fail_fast，依赖失败或 adapter 审计失败后也会取消受影响的后续任务。如果低级进程已经退出而 job 仍为 running，或其执行收据记录清理失败，调度器停止整个 run，保留失败证据供检查残留训练进程，不继续复用该设备。
 - SIGINT/SIGTERM 同样停止派发、请求低级清理并等待退出，保留已有成功产物与证据，整体记为 cancelled。高级层不强杀仍在清理或保存 checkpoint 的低级进程。
