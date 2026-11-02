@@ -222,12 +222,20 @@ def _checkpoint_state(path, world_size, deepspeed, fp16):
     names = ["rng_state.pth"] if world_size == 1 else [
         "rng_state_{}.pth".format(rank) for rank in range(world_size)]
     if deepspeed:
-        tag = "global_step{}".format(step)
-        # DeepSpeed's tag pointer belongs to this explicitly selected checkpoint.
-        # It is not a search for the latest Trainer checkpoint.
-        if (path / "latest").read_text().strip() != tag:
-            raise ValueError("DeepSpeed tag does not match the explicit Trainer checkpoint")
+        # Trainer and DeepSpeed maintain separate step counters. Follow the tag
+        # inside this explicit checkpoint; never search for another checkpoint.
+        latest = path / "latest"
+        if not latest.is_file():
+            raise ValueError("DeepSpeed checkpoint is missing its latest tag file")
+        tag = latest.read_text(encoding="utf-8").strip()
+        prefix = "global_step"
+        suffix = tag[len(prefix):] if tag.startswith(prefix) else ""
+        if not suffix or any(character not in "0123456789" for character in suffix):
+            raise ValueError("DeepSpeed latest tag must have the form global_step<number>")
+        deepspeed_step = int(suffix)
         state_dir = path / tag
+        if not state_dir.is_dir():
+            raise ValueError("DeepSpeed latest tag points to a missing state directory: " + tag)
         optimizers = list(state_dir.glob("*optim_states.pt"))
         models = list(state_dir.glob("*model_states.pt"))
         if len(optimizers) < world_size or not models:
@@ -246,8 +254,12 @@ def _checkpoint_state(path, world_size, deepspeed, fp16):
             names.append("scaler.pt")
     if any(not (path / name).is_file() or (path / name).stat().st_size == 0 for name in names):
         raise ValueError("Checkpoint optimizer/scheduler/RNG state is incomplete")
-    return {"global_step": step, "world_size": world_size,
-            "backend": "deepspeed" if deepspeed else "trainer", "state_files": sorted(names)}
+    layout = {"global_step": step, "world_size": world_size,
+              "backend": "deepspeed" if deepspeed else "trainer",
+              "state_files": sorted(names)}
+    if deepspeed:
+        layout.update({"deepspeed_tag": tag, "deepspeed_global_step": deepspeed_step})
+    return layout
 
 
 def _inputs(job, snapshot, supplied, resume_training_state, experiment_dir, world_size):
@@ -323,7 +335,10 @@ def _inputs(job, snapshot, supplied, resume_training_state, experiment_dir, worl
         if ([item["identity"] for item in source_parents] != [item["identity"] for item in adapters]):
             raise ValueError("Recovery checkpoint and planned job have different parent-adapter weights")
         layout = _checkpoint_state(checkpoint["path"], world_size, deepspeed, params["fp16"])
-        if metadata.get("checkpoint_state") != layout:
+        recorded_layout = metadata.get("checkpoint_state")
+        legacy_layout = {key: layout[key] for key in (
+            "global_step", "world_size", "backend", "state_files")}
+        if recorded_layout not in (layout, legacy_layout):
             raise ValueError("Checkpoint state layout no longer matches its recorded metadata")
     if not job["inputs"]:
         job = bind_inputs(Path(experiment_dir) / "stage-runs" / "tune" / job["run_id"] / "jobs" / job["job_id"],
