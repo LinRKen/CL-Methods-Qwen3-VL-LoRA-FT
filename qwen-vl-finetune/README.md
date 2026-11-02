@@ -13,6 +13,8 @@ The `qwenvl` directory contains the following components:
 - `trainer.py`: Main trainer updated from Huggingface Trainer
 - `train_qwen.py`: Main file for training
 - `argument.py`: Dataclasses for model, data and training arguments
+- `wandb_utils.py`: Selected physical GPU identity checks before CUDA initialization
+- `swanlab_utils.py`: W&B-to-SwanLab log forwarding and selected-card GPU metrics
 
 ### `data/`
 - `__init__.py`: Contains datasets configs
@@ -36,6 +38,23 @@ You could use follow version of packages:
 - `accelerate==1.7.0`
 - `torchcodec==0.2`
 - `peft==0.17.1`
+
+## SwanLab training monitoring
+
+The training entry point forwards the Transformers W&B integration to SwanLab using the official `swanlab.sync_wandb(wandb_run=False)` compatibility hook. Install and authenticate in the training environment:
+
+```bash
+python -m pip install -r requirements-monitoring.txt
+swanlab login
+```
+
+Keep `--report_to wandb` in existing launchers. `WANDB_PROJECT` selects the SwanLab project and `--run_name` selects the experiment name. Set `SWANLAB_MODE=online`, `offline` or `disabled`; when unset, the entry point inherits `WANDB_MODE`, defaulting to `online`. W&B itself runs offline and keeps its local compatibility files. `--report_to none` skips both reporting backends.
+
+Training requires an explicit `CUDA_VISIBLE_DEVICES` selection of physical GPUs 1–3 or their full UUIDs. The entry point resolves only those identities through NVML before importing CUDA libraries; it never falls back to other GPUs. Do not select physical GPU 0. The launcher and every worker validate the same selection.
+
+Only global rank zero creates a SwanLab run and samples the selected training cards. The native hardware probes in both SDKs are disabled because SwanLab 0.10.3 enumerates all GPUs. This also disables their automatic CPU and whole-machine hardware charts. Selected-card metrics appear as `train/gpu/<physical-index>/memory_used_mib`, `memory_total_mib`, `utilization_pct`, `power_w` and `temperature_c`. Memory and utilization describe the whole selected card, including any other processes sharing it; these are not per-process allocations. Sampling follows Trainer log events (`logging_steps`), so the maximum observed memory is not a continuous peak. Unsupported sensors emit one warning per metric and do not trigger another-device fallback; an identity mismatch is fatal.
+
+`SWANLAB_LOG_DIR` sets the local SwanLab directory, defaulting to `<output_dir>/logs/swanlab`. The compatibility hook is installed before the first `wandb.init`; after final checkpoint/state saving, the main process explicitly finishes and flushes the synchronized runs. Every training job creates a fresh SwanLab run, including an explicit Trainer checkpoint restore; monitoring history is not resumed. Pipeline-specific configuration and job directories are described in [`scripts/experiments/README.md`](../scripts/experiments/README.md).
 
 ## Custom Dataset Configuration
 

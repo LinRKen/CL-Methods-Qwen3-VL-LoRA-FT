@@ -343,16 +343,21 @@ def _environment(config, job, output, group):
     env.update({"CUDA_VISIBLE_DEVICES": ",".join(map(str, group)), "CUDA_DEVICE_ORDER": "PCI_BUS_ID",
                 "PYTHONUNBUFFERED": "1", "HF_HUB_OFFLINE": "1", "TRANSFORMERS_OFFLINE": "1",
                 "TOKENIZERS_PARALLELISM": "false", "WANDB_PROJECT": run["wandb_project"],
-                "WANDB_MODE": run["wandb_mode"], "WANDB_RUN_ID": uuid.uuid4().hex[:8],
+                "SWANLAB_MODE": run["wandb_mode"], "WANDB_MODE": "offline",
+                "WANDB_RUN_ID": uuid.uuid4().hex[:8],
                 "WANDB_RESUME": "never", "WANDB_RUN_GROUP": job["experiment_id"],
                 "WANDB_NAME": "/".join(job[key] for key in ("experiment_id", "run_id", "job_id")),
-                "WANDB_DIR": str(output / "logs" / "wandb"), "TMPDIR": "/tmp"})
+                "WANDB_DIR": str(output / "logs" / "wandb"),
+                "SWANLAB_LOG_DIR": str(output / "logs" / "swanlab"),
+                "WANDB_X_DISABLE_STATS": "true", "WANDB__DISABLE_STATS": "true",
+                "WANDB_X_DISABLE_META": "true", "WANDB_X_DISABLE_MACHINE_INFO": "true",
+                "TMPDIR": "/tmp"})
     env.setdefault("OMP_NUM_THREADS", "1")
     return env
 
 
 def _gpu_identity(config, env, group):
-    # This helper module imports only stdlib. UUIDs are resolved before torchrun starts.
+    # Resolve selected identities via NVML without importing torch or creating CUDA contexts.
     source = ("import json; from qwenvl.train.wandb_utils import prepare_training_gpu_selection; "
               "s=prepare_training_gpu_selection(); "
               "print(json.dumps({'physical_ids':s.physical_ids,'uuids':s.uuids}))")
@@ -552,6 +557,7 @@ def execute_tune_job(job_dir, *, gpu_group_index=0, input_manifests=None, resume
                 output.mkdir(parents=True, exist_ok=False)
                 owns_output = True
                 (output / "logs" / "wandb").mkdir(parents=True)
+                (output / "logs" / "swanlab").mkdir(parents=True)
                 env = _environment(config, job, output, group)
                 execution["gpu_identity"] = _gpu_identity(config, env, group)
                 execution["command"] = build_tune_command(job, config, inputs, output, len(group), master_port=master_port)
@@ -562,7 +568,9 @@ def execute_tune_job(job_dir, *, gpu_group_index=0, input_manifests=None, resume
                     "CUDA_VISIBLE_DEVICES", "CUDA_DEVICE_ORDER", "OMP_NUM_THREADS", "TOKENIZERS_PARALLELISM",
                     "HF_HUB_OFFLINE", "TRANSFORMERS_OFFLINE", "WANDB_PROJECT", "WANDB_MODE", "WANDB_RUN_ID",
                     "WANDB_RESUME", "WANDB_RUN_GROUP", "WANDB_NAME", "WANDB_DIR", "TMPDIR",
-                    "WANDB_X_STATS_GPU_DEVICE_IDS", "WANDB__STATS_GPU_DEVICE_IDS")}
+                    "WANDB_X_STATS_GPU_DEVICE_IDS", "WANDB__STATS_GPU_DEVICE_IDS",
+                    "SWANLAB_MODE", "SWANLAB_LOG_DIR", "WANDB_X_DISABLE_STATS", "WANDB__DISABLE_STATS",
+                    "WANDB_X_DISABLE_META", "WANDB_X_DISABLE_MACHINE_INFO")}
                 execution["input_fingerprints"] = {role: value["fingerprint"] for role, value in inputs.items()}
                 execution["training_state_policy"] = job["training_state_policy"]
                 execution["log_path"] = str(output / "logs" / "train.log")

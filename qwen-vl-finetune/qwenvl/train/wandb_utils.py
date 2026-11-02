@@ -1,11 +1,9 @@
-"""Keep training GPU identities and W&B system metrics in sync."""
+"""Resolve training GPU identities and preserve the W&B compatibility filter."""
 
-import csv
 from dataclasses import dataclass
 import json
 import os
 import re
-import subprocess
 import sys
 
 
@@ -20,12 +18,12 @@ class TrainingGPUSelection:
 
 
 def prepare_training_gpu_selection() -> TrainingGPUSelection:
-    """Resolve physical GPU IDs before importing libraries that initialize CUDA.
+    """Resolve only selected GPU identities through NVML, before CUDA imports.
 
-    CUDA_VISIBLE_DEVICES is the only user-facing device selection. Numeric
-    entries are physical NVIDIA indices; full GPU UUIDs are also accepted.
-    Canonical UUIDs avoid CUDA device-order ambiguity in every child process.
-    Only device identity is queried here; no CUDA context is created.
+    CUDA_VISIBLE_DEVICES accepts physical indices 1-3 or full GPU UUIDs.
+    Never enumerate the machine or fall back to another device. NVML queries
+    device identity without creating a CUDA context and avoids the nvidia-smi
+    device-selection path on hosts with unrelated device errors.
     """
     visible = os.environ.get("CUDA_VISIBLE_DEVICES", "")
     selected = [item.strip() for item in visible.split(",")]
@@ -44,52 +42,51 @@ def prepare_training_gpu_selection() -> TrainingGPUSelection:
         )
 
     try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--id=" + ",".join(selected),
-                "--query-gpu=index,uuid",
-                "--format=csv,noheader,nounits",
-            ],
-            check=True, capture_output=True, text=True, timeout=15,
-        )
-        rows = list(csv.reader(result.stdout.splitlines(), skipinitialspace=True))
-        if not rows or any(len(row) != 2 for row in rows):
-            raise ValueError("Unexpected GPU identity response")
-        by_id = {str(int(index.strip())): uuid.strip() for index, uuid in rows}
-        if len(by_id) != len(rows) or any(
-            not _GPU_UUID.fullmatch(uuid) for uuid in by_id.values()
-        ):
-            raise ValueError("Invalid or duplicated GPU identities")
-        by_uuid = {uuid: int(index) for index, uuid in by_id.items()}
-        physical_ids = tuple(
-            int(item) if item in by_id else by_uuid[item] for item in selected
-        )
-        uuids = tuple(by_id[str(index)] for index in physical_ids)
-    except (OSError, subprocess.SubprocessError, ValueError, KeyError) as error:
+        import pynvml
+    except ImportError as error:
+        raise RuntimeError("Training GPU identity checks require nvidia-ml-py.") from error
+
+    physical_ids, uuids = [], []
+    initialized = False
+    try:
+        pynvml.nvmlInit()
+        initialized = True
+        for item in selected:
+            handle = (pynvml.nvmlDeviceGetHandleByIndex(int(item)) if item.isdecimal()
+                      else pynvml.nvmlDeviceGetHandleByUUID(item))
+            index = int(pynvml.nvmlDeviceGetIndex(handle))
+            if index not in _ALLOWED_PHYSICAL_GPUS:
+                raise ValueError("Forbidden physical GPU identity: {}".format(index))
+            value = pynvml.nvmlDeviceGetUUID(handle)
+            gpu_uuid = value.decode("ascii") if isinstance(value, bytes) else value
+            if not isinstance(gpu_uuid, str) or not _GPU_UUID.fullmatch(gpu_uuid):
+                raise ValueError("Invalid GPU UUID response")
+            if (item.isdecimal() and index != int(item)) or (
+                not item.isdecimal() and gpu_uuid.lower() != item.lower()
+            ):
+                raise ValueError("NVML identity disagrees with the requested GPU")
+            physical_ids.append(index)
+            uuids.append(gpu_uuid)
+    except (pynvml.NVMLError, OSError, ValueError) as error:
         raise RuntimeError(
-            "Cannot resolve training GPU identities; refusing to initialize CUDA "
-            "or fall back to monitoring all GPUs."
+            "Cannot resolve allowed training GPU identities through NVML; "
+            "refusing to initialize CUDA or fall back to other GPUs."
         ) from error
+    finally:
+        if initialized:
+            pynvml.nvmlShutdown()
 
-    if (
-        any(index not in _ALLOWED_PHYSICAL_GPUS for index in physical_ids)
-        or len(set(physical_ids)) != len(physical_ids)
-        or len(set(uuids)) != len(uuids)
-    ):
-        raise RuntimeError("Training GPU selection is duplicated or includes forbidden physical GPU 0.")
-
+    if len(set(physical_ids)) != len(physical_ids) or len(set(uuids)) != len(uuids):
+        raise RuntimeError("Training GPU selection contains duplicate physical devices.")
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(uuids)
-    return TrainingGPUSelection(physical_ids=physical_ids, uuids=uuids)
+    return TrainingGPUSelection(physical_ids=tuple(physical_ids), uuids=tuple(uuids))
 
 
 def configure_wandb_gpu_monitoring(training_args, selection: TrainingGPUSelection) -> None:
-    """Set the native W&B GPU filter before Transformers creates its W&B run.
+    """Validate the common selection before the W&B/SwanLab compatibility hook.
 
-    W&B 0.31's NVIDIA collector uses physical NVML indices, not remapped
-    logical CUDA indices. An empty filter means all GPUs, so never emit one.
-    All ranks inherit the same selection; the existing WandbCallback still
-    creates and owns the run on the global main process only.
+    Keep W&B's physical NVML index filter for existing callers. The SwanLab
+    adapter disables native system probes and samples this same selection.
     """
     report_to = training_args.report_to or []
     if isinstance(report_to, str):
@@ -97,20 +94,22 @@ def configure_wandb_gpu_monitoring(training_args, selection: TrainingGPUSelectio
     if not any(str(item).lower() in {"wandb", "all"} for item in report_to):
         return
 
-    if not selection.physical_ids or any(
-        index not in _ALLOWED_PHYSICAL_GPUS for index in selection.physical_ids
-    ):
-        raise RuntimeError("W&B GPU monitoring requires a nonempty, allowed training GPU selection.")
+    if (not selection.physical_ids
+            or len(selection.physical_ids) != len(selection.uuids)
+            or len(set(selection.physical_ids)) != len(selection.physical_ids)
+            or len(set(selection.uuids)) != len(selection.uuids)
+            or any(index not in _ALLOWED_PHYSICAL_GPUS for index in selection.physical_ids)
+            or any(not _GPU_UUID.fullmatch(value) for value in selection.uuids)):
+        raise RuntimeError("Monitoring requires a nonempty, unique, allowed training GPU selection.")
     if os.environ.get("CUDA_VISIBLE_DEVICES") != ",".join(selection.uuids):
         raise RuntimeError("CUDA_VISIBLE_DEVICES changed after training GPU identities were resolved.")
     wandb_module = sys.modules.get("wandb")
     if wandb_module is not None and getattr(wandb_module, "run", None) is not None:
-        raise RuntimeError("Configure W&B GPU monitoring before the first wandb.init().")
+        raise RuntimeError("Configure training monitoring before the first wandb.init().")
 
     gpu_ids_json = json.dumps(list(selection.physical_ids))
-    # Both supported environment spellings must agree if either was preset.
     os.environ["WANDB_X_STATS_GPU_DEVICE_IDS"] = gpu_ids_json
     os.environ["WANDB__STATS_GPU_DEVICE_IDS"] = gpu_ids_json
     if training_args.process_index == 0:
         identities = dict(zip(selection.physical_ids, selection.uuids))
-        print(f"[W&B] Monitoring training physical GPUs only: {identities}", flush=True)
+        print(f"[Monitor] Training physical GPU selection: {identities}", flush=True)
