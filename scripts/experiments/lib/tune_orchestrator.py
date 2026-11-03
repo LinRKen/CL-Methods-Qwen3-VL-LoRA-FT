@@ -303,7 +303,9 @@ def _prepare_launch(info, jobs, resource):
         source_job, _ = load_job(source_dir)
         inputs = dict(job.get("recovery_external_inputs", {}))
         if parent is not None:
-            inputs[parent["input_role"]] = parent["manifest"]
+            # Recovery helpers consume manifest objects; the low-level executor
+            # path uses the manifest filename, so load it at this boundary.
+            inputs[parent["input_role"]] = read_json(parent["manifest"])
         checkpoint = None
         if not job["inputs"] and source_job["status"] in ("failed", "cancelled"):
             candidate = _recovery_checkpoint(source_dir, source_job,
