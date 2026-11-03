@@ -15,7 +15,7 @@ from .config import resolve_job_config
 from .orchestration_logging import run_logged
 from .records import (
     activate_recovery_stage_run, create_job, create_recovery_stage_run, import_recovery_adapter,
-    load_experiment, load_job, load_stage_run, record_status, update_status,
+    bind_inputs, load_experiment, load_job, load_stage_run, record_status, set_recovery_source, update_status,
 )
 from .tune_executor import (CONTINUE, FRESH, RESTORE, _checkpoint_state, _context as _tune_job_context)
 
