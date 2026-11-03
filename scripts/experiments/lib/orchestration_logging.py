@@ -14,15 +14,46 @@ from .records import load_stage_run, load_stage_run_metadata
 class _Tee:
     def __init__(self, stream, log):
         self.stream, self.log = stream, log
+        self._forward_to_stream = True
+
+    def _stop_forwarding(self):
+        self._forward_to_stream = False
+        try:
+            descriptor = self.stream.fileno()
+            null_descriptor = os.open(os.devnull, os.O_WRONLY)
+        except (AttributeError, OSError, ValueError):
+            return
+        try:
+            # Keep the original TextIOWrapper safe to flush during interpreter
+            # shutdown after its pipe consumer has gone away.
+            os.dup2(null_descriptor, descriptor)
+        except OSError:
+            pass
+        finally:
+            os.close(null_descriptor)
 
     def write(self, value):
-        self.log.write(value)
+        written = self.log.write(value)
         self.log.flush()
-        return self.stream.write(value)
+        if not self._forward_to_stream:
+            return written
+        try:
+            return self.stream.write(value)
+        except BrokenPipeError:
+            # Console output is best-effort; the persistent orchestration log
+            # remains authoritative and the scheduler must keep running.
+            self._stop_forwarding()
+            return written
 
     def flush(self):
         self.log.flush()
-        self.stream.flush()
+        if not self._forward_to_stream:
+            return
+        try:
+            self.stream.flush()
+        except BrokenPipeError:
+            # Do not let a closed stdout/stderr consumer abort orchestration.
+            self._stop_forwarding()
 
     def __getattr__(self, name):
         return getattr(self.stream, name)
