@@ -152,8 +152,9 @@ def _registered_producer(manifest, records_root):
             or any(source_run[key] != producer[key] for key in ("experiment_id", "stage", "run_id"))
             or any(source_job[key] != value for key, value in producer.items())
             or source_job["status"] not in allowed_statuses
-            or {"stage": producer["stage"], "run_id": producer["run_id"],
-                "path": source_run_dir.relative_to(source_experiment_dir).as_posix()} not in source_experiment["stage_runs"]
+            or not any(item == {"stage": producer["stage"], "run_id": producer["run_id"],
+                               "path": source_run_dir.relative_to(source_experiment_dir).as_posix()}
+                       for item in source_experiment["stage_runs"] + source_experiment.get("retired_stage_runs", []))
             or {"job_id": producer["job_id"], "path": "jobs/" + producer["job_id"]} not in source_run["jobs"]):
         raise ValueError("Inherited manifest does not identify an eligible registered producer")
     if not any(item["kind"] == manifest["kind"] and item["fingerprint"] == manifest["fingerprint"]

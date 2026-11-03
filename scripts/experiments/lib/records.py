@@ -244,6 +244,135 @@ def create_stage_run(experiment_dir, stage, cli_override=None, run_id=None, stag
     return directory
 
 
+def create_recovery_stage_run(experiment_dir, source_run_dir, run_id=None):
+    """Create an unregistered tune recovery run while retaining its source run."""
+    experiment_dir = Path(experiment_dir).expanduser().resolve(strict=True)
+    source_run_dir = Path(source_run_dir).expanduser().resolve(strict=True)
+    experiment, _ = load_experiment(experiment_dir)
+    source, snapshot = load_stage_run(source_run_dir)
+    if (source["stage"] != "tune" or source_run_dir.parent.name != "tune"
+            or source_run_dir.name != source["run_id"]
+            or source["experiment_id"] != experiment["experiment_id"]
+            or source["status"] not in ("failed", "cancelled")
+            or experiment["status"] != "active"):
+        raise ValueError("Recovery requires a failed/cancelled tune run in an active experiment")
+    identifier = require_id(run_id if run_id is not None else new_id("tune-recovery"))
+    directory = experiment_dir / "stage-runs" / "tune" / identifier
+    record = deepcopy(source)
+    record.update(run_id=identifier, status="planned", created_at=utc_now(), updated_at=utc_now(),
+                  jobs=[], recovery_of=source["run_id"],
+                  output_root=str(Path(snapshot["config"]["experiment"]["checkpoints_root"])
+                                  / experiment["experiment_id"] / identifier))
+    record.pop("status_message", None)
+    with record_lock(experiment_dir):
+        parent, parent_record = _read_record(experiment_dir, "experiment.json")
+        source_registration = {"stage": "tune", "run_id": source["run_id"],
+                              "path": source_run_dir.relative_to(experiment_dir).as_posix()}
+        if source_registration not in parent_record["stage_runs"]:
+            raise ValueError("Recovery source is not the current registered tune run")
+        if directory.exists():
+            raise FileExistsError(directory)
+        directory.mkdir(parents=True)
+        (directory / "jobs").mkdir()
+        write_json_atomic(directory / "config.snapshot.json", snapshot)
+        write_json_atomic(directory / "plan.json", read_json(source_run_dir / "plan.json"))
+        write_json_atomic(directory / "run.json", record)
+    return directory
+
+
+def activate_recovery_stage_run(experiment_dir, source_run_dir, recovery_run_dir):
+    """Register a fully prepared recovery run and preserve its source run on disk."""
+    experiment_dir = Path(experiment_dir).expanduser().resolve(strict=True)
+    source_run_dir = Path(source_run_dir).expanduser().resolve(strict=True)
+    recovery_run_dir = Path(recovery_run_dir).expanduser().resolve(strict=True)
+    recovery, _ = load_stage_run(recovery_run_dir)
+    source, _ = load_stage_run(source_run_dir)
+    with record_lock(experiment_dir):
+        parent_path, parent = _read_record(experiment_dir, "experiment.json")
+        source_registration = {"stage": "tune", "run_id": source["run_id"],
+                              "path": source_run_dir.relative_to(experiment_dir).as_posix()}
+        recovery_registration = {"stage": "tune", "run_id": recovery["run_id"],
+                                 "path": recovery_run_dir.relative_to(experiment_dir).as_posix()}
+        if (parent["status"] != "active" or source_registration not in parent["stage_runs"]
+                or recovery.get("recovery_of") != source["run_id"]
+                or recovery["status"] != "planned"):
+            raise ValueError("Recovery registration changed before activation")
+        plan = _load_planned_jobs(recovery_run_dir, recovery)
+        registered = {item["job_id"] for item in recovery["jobs"]}
+        if plan is None or registered != set(plan) or len(recovery["jobs"]) != len(plan):
+            raise ValueError("Recovery run is missing jobs from its frozen plan")
+        parent["stage_runs"] = [recovery_registration if item == source_registration else item
+                                for item in parent["stage_runs"]]
+        history = parent.setdefault("retired_stage_runs", [])
+        if source_registration not in history:
+            history.append(source_registration)
+        parent["updated_at"] = utc_now()
+        write_json_atomic(parent_path, parent)
+
+
+def set_recovery_source(job_dir, source_job_dir, external_inputs):
+    """Attach immutable source-attempt references to a new planned recovery job."""
+    job_dir = Path(job_dir).expanduser().resolve(strict=True)
+    source_job_dir = Path(source_job_dir).expanduser().resolve(strict=True)
+    normalized = _normalize_inputs(external_inputs)
+    with record_lock(job_dir):
+        record_path, record = _read_record(job_dir, "job.json")
+        if record["status"] != "planned" or record["inputs"] or record["artifacts"]:
+            raise ValueError("Recovery source can only be attached to an empty planned job")
+        record["recovery_source_job_dir"] = str(source_job_dir)
+        record["recovery_external_inputs"] = normalized
+        record["updated_at"] = utc_now()
+        write_json_atomic(record_path, record)
+
+
+def import_recovery_adapter(job_dir, source_job_dir, inputs):
+    """Reuse a verified adapter under the new job identity without copying its payload."""
+    from .artifacts import make_manifest
+    from .tune_orchestrator import _successful_adapter
+
+    job_dir = Path(job_dir).expanduser().resolve(strict=True)
+    source_job_dir = Path(source_job_dir).expanduser().resolve(strict=True)
+    source, _ = load_job(source_job_dir)
+    source_adapter = _successful_adapter(source_job_dir, source, verify_contents=True)
+    job, _ = load_job(job_dir)
+    if (job["status"] != "planned" or job["artifacts"]
+            or job["task"] != source["task"]
+            or job["config_fingerprint"] != source["config_fingerprint"]
+            or job["lineage"] != source["lineage"]
+            or job["output_spec"] != source["output_spec"]):
+        raise ValueError("Recovery job does not match its successful source job")
+    normalized = _normalize_inputs(inputs)
+    _validate_input_specs(job["input_specs"], normalized)
+    _validate_required_inputs(job["requires"], normalized, job["experiment_id"])
+    source_manifest = check_manifest(read_json(source_adapter["manifest"]), verify_contents=True)
+    metadata = deepcopy(source_manifest["metadata"])
+    metadata["inherited_inputs"] = {role: item["fingerprint"] for role, item in normalized.items()
+                                    if item["kind"] in ("adapter", "checkpoint")}
+    output_adapter = Path(job["output_dir"]) / "adapter"
+    output_adapter.parent.mkdir(parents=True, exist_ok=False)
+    output_adapter.symlink_to(source_manifest["path"], target_is_directory=True)
+    producer = {key: job[key] for key in ("experiment_id", "stage", "run_id", "job_id")}
+    manifest = make_manifest("adapter", output_adapter, producer=producer, metadata=metadata)
+    with record_lock(job_dir):
+        record_path, record = _read_record(job_dir, "job.json")
+        if (record["status"] != "planned" or record["artifacts"]
+                or record["inputs"] not in ({}, normalized)):
+            raise ValueError("Recovery job changed while importing its adapter")
+        _validate_input_specs(record["input_specs"], normalized)
+        _validate_required_inputs(record["requires"], normalized, record["experiment_id"])
+        if not record["inputs"]:
+            record["inputs"] = normalized
+        record["reused_from"] = {"job": {key: source[key] for key in
+                                           ("experiment_id", "stage", "run_id", "job_id")},
+                                  "fingerprint": source_manifest["fingerprint"]}
+        record["status"] = "running"
+        record["updated_at"] = utc_now()
+        write_json_atomic(record_path, record)
+    register_artifact(job_dir, "adapter", manifest)
+    update_status(job_dir, "succeeded", "Reused verified adapter from recovery source run")
+    return manifest
+
+
 def _load_planned_jobs(directory, record):
     """Read the frozen plan and index its jobs, if this run has a plan."""
     if record["plan"] is None:

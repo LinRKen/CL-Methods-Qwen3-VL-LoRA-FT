@@ -9,14 +9,15 @@ import subprocess
 import time
 import traceback
 
-from .artifacts import check_manifest
-from .common import TASKS, read_json, utc_now, write_json_atomic
+from .artifacts import check_manifest, make_manifest
+from .common import TASKS, read_json, sha256_file, utc_now, write_json_atomic
 from .config import resolve_job_config
 from .orchestration_logging import run_logged
 from .records import (
+    activate_recovery_stage_run, create_job, create_recovery_stage_run, import_recovery_adapter,
     load_experiment, load_job, load_stage_run, record_status, update_status,
 )
-from .tune_executor import CONTINUE, FRESH, RESTORE, _context as _tune_job_context
+from .tune_executor import (CONTINUE, FRESH, RESTORE, _checkpoint_state, _context as _tune_job_context)
 
 SUPPORTED_SETTINGS = ("multitask", "singletask", "cl", "transfer_round1", "transfer_round2")
 
@@ -29,7 +30,7 @@ def require_supported_setting(snapshot):
         raise ValueError("The experiment must enable the tune stage")
 
 
-def _context(run_dir):
+def _context(run_dir, *, recovery_source=False):
     run_dir = Path(run_dir).expanduser().resolve(strict=True)
     run, snapshot = load_stage_run(run_dir)
     if run["stage"] != "tune" or run_dir.name != run["run_id"]:
@@ -42,11 +43,14 @@ def _context(run_dir):
         raise ValueError("Tune run directory disagrees with its frozen records_root")
     experiment, experiment_snapshot = load_experiment(experiment_dir)
     if (experiment["experiment_id"] != experiment_id or experiment["status"] != "active"
-            or run["status"] not in ("planned", "running")
+            or (run["status"] not in ("planned", "running")
+                and not (recovery_source and run["status"] in ("failed", "cancelled")))
             or snapshot["layers"].get("parent_snapshot") != experiment_snapshot["snapshot_fingerprint"]
             or config["experiment"] != experiment_snapshot["config"]["experiment"]
-            or {"stage": "tune", "run_id": run["run_id"],
-                "path": run_dir.relative_to(experiment_dir).as_posix()} not in experiment["stage_runs"]):
+            or not any(item == {"stage": "tune", "run_id": run["run_id"],
+                               "path": run_dir.relative_to(experiment_dir).as_posix()}
+                       for item in (experiment["stage_runs"] + experiment.get("retired_stage_runs", [])
+                                    if recovery_source else experiment["stage_runs"]))):
         raise ValueError("Tune run is not an active child of its frozen experiment")
     if run["plan"] != "plan.json":
         raise ValueError("Tune orchestration requires a frozen stage-run plan")
@@ -182,7 +186,8 @@ def _context(run_dir):
                            / experiment_id / run["run_id"] / job_id)
         if Path(job["output_dir"]) != expected_output:
             raise ValueError("Job output directory disagrees with the frozen checkpoints_root: " + job_id)
-        if job["status"] not in ("planned", "succeeded"):
+        allowed_statuses = ("planned", "succeeded", "failed", "cancelled") if recovery_source else ("planned", "succeeded")
+        if job["status"] not in allowed_statuses:
             raise ValueError("Job {} is {}; do not relaunch active or terminal attempts".format(
                 job_id, job["status"]))
         info = {"directory": directory, "task": task, "snapshot": job_snapshot,
@@ -192,7 +197,7 @@ def _context(run_dir):
                 raise ValueError("An unexecuted planned job cannot have outputs: " + job_id)
             # Dependent jobs are not ready yet. Repeat low-level checks just
             # before launch, after the parent executor has exited.
-            if not job["depends_on"]:
+            if not recovery_source and not job["depends_on"]:
                 _tune_job_context(directory)
             if ((directory / "execution.json").exists() or Path(job["output_dir"]).exists()
                     or Path(job["output_dir"]).is_symlink()):
@@ -202,14 +207,24 @@ def _context(run_dir):
             python = Path(job_run["python"])
             if not python.is_file() or not os.access(python, os.X_OK):
                 raise ValueError("Job Python is not executable: {}".format(python))
+            restore_checkpoints = [item for item in job["inputs"].values()
+                                   if item["kind"] == "checkpoint"]
+            if restore_checkpoints:
+                required_world_size = restore_checkpoints[0]["metadata"].get("world_size")
+            else:
+                required_world_size = None
             info["resources"] = []
             for index, group in enumerate(job_run["gpu_groups"]):
+                if required_world_size is not None and len(group) != required_world_size:
+                    continue
                 port = job_run["master_port"] + index
                 if port > 65535:
                     raise ValueError("Job {} has master_port + GPU group index above 65535".format(job_id))
                 info["resources"].append({"group_index": index, "physical_gpu_ids": list(group),
                                           "port": (job_run["master_addr"], port)})
-        else:
+            if not info["resources"]:
+                raise ValueError("No frozen GPU group matches the recovery source assignment: " + job_id)
+        elif job["status"] == "succeeded":
             info["adapter"] = _successful_adapter(directory, job)
         jobs[job_id] = info
     for job_id, info in jobs.items():
@@ -220,9 +235,12 @@ def _context(run_dir):
             if any(jobs[parent]["initial_status"] != "succeeded" for parent in info["depends_on"]):
                 raise ValueError("Succeeded jobs require every dependency to have succeeded: " + job_id)
             info["parent_adapter"] = _parent_adapter(job, jobs, require_bound=True)
-        elif job["inputs"]:
-            # A manually bound job must still use this run's exact parent.
-            info["parent_adapter"] = _parent_adapter(job, jobs, require_bound=True)
+        elif job["inputs"] and info["depends_on"]:
+            # A previously launched dependent attempt must have been bound only
+            # after its parent succeeded; preserve that lineage for recovery.
+            parent = jobs[info["depends_on"][0]]
+            if parent["initial_status"] == "succeeded":
+                info["parent_adapter"] = _parent_adapter(job, jobs, require_bound=True)
     return run_dir, run, snapshot, setting, jobs
 
 
@@ -265,18 +283,61 @@ def _parent_adapter(job, jobs, *, require_bound=False):
     return {**parent, "input_role": role}
 
 
-def _prepare_launch(info, jobs):
-    job, snapshot, _, _ = _tune_job_context(info["directory"])
+def _prepare_launch(info, jobs, resource):
+    job, snapshot, experiment_dir, _ = _tune_job_context(info["directory"])
     if (snapshot["snapshot_fingerprint"] != info["snapshot"]["snapshot_fingerprint"]
             or job["depends_on"] != info["depends_on"]):
         raise ValueError("Frozen job changed while waiting for its dependencies")
     _training_policy(job)
     info["input_manifests"] = {}
+    parent = None
     if info["depends_on"]:
         parent = _parent_adapter(job, jobs)
         info["parent_adapter"] = parent
         if not job["inputs"]:
             info["input_manifests"][parent["input_role"]] = parent["manifest"]
+
+    source_dir = job.get("recovery_source_job_dir")
+    if source_dir:
+        source_dir = Path(source_dir).resolve(strict=True)
+        source_job, _ = load_job(source_dir)
+        inputs = dict(job.get("recovery_external_inputs", {}))
+        if parent is not None:
+            inputs[parent["input_role"]] = parent["manifest"]
+        checkpoint = None
+        if not job["inputs"] and source_job["status"] in ("failed", "cancelled"):
+            candidate = _recovery_checkpoint(source_dir, source_job,
+                                             {"job": job, "snapshot": snapshot,
+                                              "directory": info["directory"], "task": job["task"]},
+                                             inputs)
+            if (candidate is not None
+                    and candidate["metadata"].get("world_size") != len(resource["physical_gpu_ids"])):
+                return "checkpoint_world_size_mismatch"
+            checkpoint = candidate
+        if checkpoint is not None:
+            inputs["resume-checkpoint"] = checkpoint
+        if not job["inputs"]:
+            job = bind_inputs(info["directory"], inputs,
+                              resume_training_state=checkpoint is not None)
+        # The recovery job now owns frozen input manifests; do not pass a second
+        # set of CLI inputs to the low-level executor.
+        info["input_manifests"] = {}
+        info["restore_checkpoint"] = checkpoint
+        info["recovery_fallback"] = (None if checkpoint else
+                                       ("continue_parent_adapter" if parent else "fresh_from_base"))
+        if _can_reuse_success(source_dir, source_job, {**job, "snapshot": snapshot}, inputs):
+            manifest = import_recovery_adapter(info["directory"], source_dir, inputs)
+            info["adapter"] = {"manifest": str(info["directory"] / "artifacts/adapter.json"),
+                                "path": manifest["path"], "fingerprint": manifest["fingerprint"],
+                                "producer": manifest["producer"],
+                                "slot": manifest["metadata"]["slot"]}
+            info["reused_successful_adapter"] = True
+            return True
+        info["reused_successful_adapter"] = False
+        return False
+    if info["depends_on"] and not job["inputs"]:
+        info["input_manifests"][parent["input_role"]] = parent["manifest"]
+    return False
 
 
 def _successful_adapter(job_dir, job, *, verify_contents=True):
@@ -305,10 +366,37 @@ def _successful_adapter(job_dir, job, *, verify_contents=True):
         metadata = manifest["metadata"]
         inherited = {role: item["fingerprint"] for role, item in job["inputs"].items()
                      if item["kind"] in ("adapter", "checkpoint")}
-        if (metadata.get("lineage") != job["lineage"]
-                or metadata.get("training_state_policy") != job["training_state_policy"]
-                or metadata.get("inherited_inputs") != inherited):
+        if metadata.get("lineage") != job["lineage"] or metadata.get("inherited_inputs") != inherited:
             raise ValueError("Adapter metadata disagrees with its recorded weight lineage")
+        reused = job.get("reused_from")
+        if reused is None:
+            if metadata.get("training_state_policy") != job["training_state_policy"]:
+                raise ValueError("Adapter training-state policy differs from its producing job")
+        else:
+            producer = reused.get("job")
+            if (not isinstance(producer, dict)
+                    or set(producer) != {"experiment_id", "stage", "run_id", "job_id"}
+                    or producer["stage"] != "tune"):
+                raise ValueError("Reused adapter source identity is malformed")
+            _, job_snapshot = load_job(job_dir)
+            records_root = Path(job_snapshot["config"]["experiment"]["records_root"])
+            source_dir = records_root / producer["experiment_id"] / "stage-runs" / "tune" / producer["run_id"] / "jobs" / producer["job_id"]
+            source_job, _ = load_job(source_dir)
+            source_artifact = next((item for item in source_job["artifacts"]
+                                    if item["kind"] == "adapter"
+                                    and item["fingerprint"] == reused.get("fingerprint")), None)
+            if (source_job["status"] != "succeeded" or source_artifact is None
+                    or any(source_job[key] != producer[key] for key in producer)
+                    or source_job["task"] != job["task"]
+                    or source_job["config_fingerprint"] != job["config_fingerprint"]
+                    or source_job["lineage"] != job["lineage"]):
+                raise ValueError("Reused adapter no longer matches its successful source job")
+            source_manifest = check_manifest(read_json(source_dir / source_artifact["path"]),
+                                             verify_contents=verify_contents)
+            if (source_manifest["fingerprint"] != reused["fingerprint"]
+                    or source_manifest["identity"] != manifest["identity"]
+                    or source_manifest["metadata"].get("lineage") != job["lineage"]):
+                raise ValueError("Reused adapter payload or lineage differs from its source")
     return {"manifest": str(manifest_path), "path": manifest["path"],
             "fingerprint": manifest["fingerprint"], "producer": manifest["producer"],
             "slot": manifest["metadata"]["slot"]}
@@ -381,11 +469,17 @@ def _summary(run_dir, invocation_dir, run, setting, jobs, started_at, status, de
                         "training_state_policy": record["training_state_policy"],
                         "resume_training_state": record["resume_training_state"],
                         "parent_adapter": info.get("parent_adapter"), "blocked_by": info.get("blocked_by", []),
+                        "reused_from": record.get("reused_from"),
+                        "reused_successful_adapter": info.get("reused_successful_adapter", False),
+                        "restore_checkpoint": (info["restore_checkpoint"].get("fingerprint")
+                                               if info.get("restore_checkpoint") else None),
+                        "recovery_fallback": info.get("recovery_fallback"),
                         "artifacts": [{**artifact, "manifest": str(info["directory"] / artifact["path"])}
                                       for artifact in record["artifacts"]]})
     result = {
         "schema_version": 1, "kind": "tune_run_summary", "experiment_id": run["experiment_id"],
-        "run_id": run["run_id"], "setting": setting, "status": status,
+        "run_id": run["run_id"], "recovery_of": run.get("recovery_of"),
+        "setting": setting, "status": status,
         "job_order": list(jobs), "task_order": [info["task"] for info in jobs.values()],
         "config_fingerprint": run["config_fingerprint"], "invocation_dir": str(invocation_dir),
         "started_at": started_at, "finished_at": utc_now(), "jobs": entries,
@@ -483,6 +577,156 @@ def _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receip
     launch.update(pid=process.pid, status="running")
 
 
+def _external_inputs(job, cache):
+    inputs = {}
+    for spec in job["input_specs"]:
+        cached = job["inputs"].get(spec["role"])
+        if cached is not None:
+            if (cached["kind"] != spec["kind"]
+                    or cached["requested_path"] != str(Path(spec["path"]).expanduser().absolute())
+                    or cached["external_source"] != spec["source"]
+                    or cached["metadata"] != spec["metadata"]):
+                raise ValueError("Frozen recovery input binding changed: " + spec["role"])
+            verified_key = ("verified", cached["fingerprint"])
+            if verified_key not in cache:
+                check_manifest(cached, verify_contents=True)
+                cache[verified_key] = cached
+            inputs[spec["role"]] = cached
+            continue
+        key = (spec["kind"], spec["path"], spec["source"], tuple(sorted(spec["metadata"].items())))
+        if key not in cache:
+            cache[key] = make_manifest(spec["kind"], spec["path"], source=spec["source"],
+                                       metadata=spec["metadata"])
+        inputs[spec["role"]] = cache[key]
+    return inputs
+
+
+def _recovery_checkpoint(source_dir, source_job, target_job, inputs):
+    """Return the newest registered checkpoint that matches this exact retry."""
+    if source_job["status"] not in ("failed", "cancelled"):
+        return None
+    config = target_job["snapshot"]["config"]
+    params = config["tune"]["params"]
+    groups = config["tune"]["run"]["gpu_groups"]
+    world_sizes = {len(group) for group in groups}
+    source_receipt = read_json(source_dir / "execution.json") if (source_dir / "execution.json").is_file() else {}
+    assigned = source_receipt.get("physical_gpu_ids")
+    if isinstance(assigned, list) and assigned:
+        source_world_size = len(assigned)
+        if source_world_size not in world_sizes:
+            return None
+    deepspeed_sha = sha256_file(params["deepspeed"]) if params["deepspeed"] else None
+    expected_inputs = {role: manifest["fingerprint"] for role, manifest in inputs.items()
+                       if manifest["kind"] not in ("adapter", "checkpoint")}
+    expected_parent = [item for item in inputs.values() if item["kind"] == "adapter"]
+    candidates = []
+    for item in source_job["artifacts"]:
+        if item["kind"] != "checkpoint":
+            continue
+        try:
+            manifest_path = source_dir / item["path"]
+            manifest = check_manifest(read_json(manifest_path), verify_contents=True)
+            if (manifest["kind"] != "checkpoint"
+                    or manifest["producer"] != {key: source_job[key] for key in
+                                                   ("experiment_id", "stage", "run_id", "job_id")}
+                    or manifest["fingerprint"] != item["fingerprint"]):
+                continue
+            metadata = manifest["metadata"]
+            if (metadata.get("training_task") != target_job["task"]
+                    or metadata.get("config_fingerprint") != target_job["job"]["config_fingerprint"]
+                    or metadata.get("lineage") != target_job["job"]["lineage"]
+                    or metadata.get("input_fingerprints") != expected_inputs
+                    or metadata.get("world_size") not in world_sizes
+                    or metadata.get("deepspeed_sha256") != deepspeed_sha):
+                continue
+            source_parents = [value for value in source_job["inputs"].values()
+                              if value["kind"] == "adapter"]
+            if ([value["identity"] for value in source_parents]
+                    != [value["identity"] for value in expected_parent]):
+                continue
+            layout = _checkpoint_state(manifest["path"], metadata["world_size"],
+                                       params["deepspeed"], params["fp16"])
+            recorded = metadata.get("checkpoint_state")
+            legacy = {key: layout[key] for key in
+                      ("global_step", "world_size", "backend", "state_files")}
+            if recorded not in (layout, legacy) or metadata.get("global_step") != layout["global_step"]:
+                continue
+            candidates.append((layout["global_step"], manifest))
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+    return max(candidates, key=lambda item: item[0])[1] if candidates else None
+
+
+def _can_reuse_success(source_dir, source_job, recovery_job, recovery_inputs):
+    """Reuse only if frozen config, external inputs and parent weights still match."""
+    if (source_job["status"] != "succeeded"
+            or source_job["config_fingerprint"] != recovery_job["config_fingerprint"]
+            or source_job["lineage"] != recovery_job["lineage"]):
+        return False
+    try:
+        source_adapter = _successful_adapter(source_dir, source_job, verify_contents=True)
+        metadata = check_manifest(read_json(source_adapter["manifest"]),
+                                  verify_contents=True)["metadata"]
+    except (OSError, ValueError, KeyError):
+        return False
+    current_external = {role: manifest["fingerprint"] for role, manifest in recovery_inputs.items()
+                        if manifest["kind"] not in ("adapter", "checkpoint")}
+    if metadata.get("input_fingerprints") != current_external:
+        return False
+    params = recovery_job["snapshot"]["config"]["tune"]["params"]
+    deepspeed_sha = sha256_file(params["deepspeed"]) if params["deepspeed"] else None
+    if metadata.get("deepspeed_sha256") != deepspeed_sha:
+        return False
+    source_parents = [item for item in source_job["inputs"].values() if item["kind"] == "adapter"]
+    current_parents = [item for item in recovery_inputs.values() if item["kind"] == "adapter"]
+    return [item["identity"] for item in source_parents] == [item["identity"] for item in current_parents]
+
+
+def prepare_tune_recovery(source_run_dir):
+    """Create and register a new recovery run without launching model work."""
+    source_run_dir = Path(source_run_dir).expanduser().resolve(strict=True)
+    source_context = _context(source_run_dir, recovery_source=True)
+    _, source_run, snapshot, _, source_jobs = source_context
+    experiment_dir = source_run_dir.parents[2]
+    recovery_dir = create_recovery_stage_run(experiment_dir, source_run_dir)
+    cache = {}
+    activated = False
+    try:
+        for job_id, source_info in source_jobs.items():
+            source_job, source_snapshot = load_job(source_info["directory"])
+            fields = {"task": source_job["task"], "tasks": source_job["tasks"],
+                      "depends_on": source_job["depends_on"], "requires": source_job["requires"],
+                      "input_specs": source_job["input_specs"], "lineage": source_job["lineage"],
+                      "output": source_job["output_spec"]}
+            external_inputs = _external_inputs(source_job, cache)
+            target_dir = create_job(
+                recovery_dir, job_id,
+                job_override=source_snapshot["layers"].get("job"),
+                cli_override=source_snapshot["layers"].get("job_cli"),
+                inputs={}, resume_training_state=False, **fields)
+            set_recovery_source(target_dir, source_info["directory"], external_inputs)
+        activate_recovery_stage_run(experiment_dir, source_run_dir, recovery_dir)
+        activated = True
+    except BaseException:
+        import shutil
+        for child in recovery_dir.glob("jobs/*/job.json"):
+            try:
+                job_record = read_json(child)
+                output = Path(job_record["output_dir"])
+                expected = (Path(snapshot["config"]["experiment"]["checkpoints_root"])
+                            / source_run["experiment_id"] / recovery_dir.name / job_record["job_id"])
+                if output == expected and output.is_symlink():
+                    output.unlink()
+                elif output == expected and output.is_dir():
+                    shutil.rmtree(output)
+            except (OSError, ValueError, KeyError):
+                pass
+        if not activated:
+            shutil.rmtree(recovery_dir, ignore_errors=True)
+        raise
+    return recovery_dir
+
+
 def execute_tune_run(run_dir):
     """Schedule frozen tune dependencies with resource and failure handling."""
     return run_logged("tune", run_dir, _execute_tune_run)
@@ -502,6 +746,7 @@ def _execute_tune_run(run_dir, invocation_dir):
             raise ValueError("Low-level tune entry point is missing: {}".format(low_level))
         started_at = utc_now()
         receipt = {"schema_version": 1, "run_id": run["run_id"], "experiment_id": run["experiment_id"],
+                   "recovery_of": run.get("recovery_of"),
                    "config_fingerprint": run["config_fingerprint"], "started_at": started_at,
                    "pid": os.getpid(), "status": "running", "max_parallel_jobs": capacity,
                    "fail_fast": fail_fast, "setting": setting, "job_order": list(jobs), "launches": []}
@@ -552,28 +797,49 @@ def _execute_tune_run(run_dir, invocation_dir):
                         if any(parent in pending or parent in active or "adapter" not in jobs[parent]
                                for parent in info["depends_on"]):
                             continue
-                        resource = next((item for item in info["resources"]
-                                         if not busy_gpus.intersection(item["physical_gpu_ids"])
-                                         and item["port"] not in busy_ports), None)
-                        if resource is None:
+                        resources = [item for item in info["resources"]
+                                     if not busy_gpus.intersection(item["physical_gpu_ids"])
+                                     and item["port"] not in busy_ports]
+                        if not resources:
                             continue
-                        try:
-                            _prepare_launch(info, jobs)
-                            _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receipt, active)
-                        except (OSError, ValueError, KeyError) as error:
-                            pending.remove(job_id)
-                            _mark(info["directory"], "failed", "Cannot launch low-level executor: {}".format(error))
-                            failures.append({"job_id": job_id, "message": str(error),
-                                             "traceback": traceback.format_exc()})
-                            write_json_atomic(invocation_dir / "execution.json", receipt)
-                            if fail_fast:
+                        deferred = False
+                        launched = False
+                        for resource in resources:
+                            try:
+                                reused = _prepare_launch(info, jobs, resource)
+                                if reused == "checkpoint_world_size_mismatch":
+                                    deferred = True
+                                    continue
+                                if reused:
+                                    pending.remove(job_id)
+                                    record = load_job(info["directory"])[0]
+                                    receipt["launches"].append({"job_id": job_id, "status": "reused",
+                                                                "reused_from": record.get("reused_from"),
+                                                                "assignment": resource})
+                                    write_json_atomic(invocation_dir / "execution.json", receipt)
+                                    print("Reused verified adapter for {}".format(job_id), flush=True)
+                                    launched = True
+                                    break
+                                _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receipt, active)
+                            except (OSError, ValueError, KeyError) as error:
+                                pending.remove(job_id)
+                                _mark(info["directory"], "failed", "Cannot launch low-level executor: {}".format(error))
+                                failures.append({"job_id": job_id, "message": str(error),
+                                                 "traceback": traceback.format_exc()})
+                                write_json_atomic(invocation_dir / "execution.json", receipt)
+                                launched = True
                                 break
+                            pending.remove(job_id)
+                            write_json_atomic(invocation_dir / "execution.json", receipt)
+                            busy_gpus.update(resource["physical_gpu_ids"])
+                            busy_ports.add(resource["port"])
+                            launched = True
+                            break
+                        if not launched and deferred:
                             continue
-                        pending.remove(job_id)
-                        write_json_atomic(invocation_dir / "execution.json", receipt)
-                        busy_gpus.update(resource["physical_gpu_ids"])
-                        busy_ports.add(resource["port"])
-                        if len(active) >= capacity:
+                        if fail_fast and failures:
+                            break
+                        if launched and len(active) >= capacity:
                             break
 
                 if active:
