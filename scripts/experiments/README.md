@@ -149,6 +149,8 @@ manifest 保存精确文件/目录、文件大小、完整 SHA-256 和来源：�
 cd /home/linruikang/CL/CL-Methods/Qwen3-VL/LoRA-FT
 python scripts/experiments/pipeline.py plan --config scripts/experiments/configs/cl_mhpnvg.yaml
 python scripts/experiments/pipeline.py prepare --config scripts/experiments/configs/cl_mhpnvg.yaml --experiment-id cl-mhpnvg-example
+# 失败/取消后，从冻结的高级 tune run 创建独立恢复 run 并继续调度
+python scripts/experiments/run_tune.py --resume-from-run-dir /绝对路径/<experiment>/stage-runs/tune/<failed-run-id>
 ~~~
 
 plan 只打印 JSON 计划；prepare 创建记录但不执行模型。可使用 --default 指定其他默认 YAML，使用 --set infer.params.batch_size=2 等点号参数临时覆盖。run_tune_job.py 接受准备好的 job 目录和冻结 gpu_groups 的零起始索引。例如：
@@ -166,7 +168,9 @@ python scripts/experiments/run_tune_job.py \
   --input parent-motion=/home/linruikang/data/results/CL-Methods/Qwen3-VL/LoRA-FT/<experiment-id>/stage-runs/tune/<run-id>/jobs/tune-01-motion/artifacts/adapter.json
 ~~~
 
-恢复同一训练任务的中断状态时，给新的 planned job 显式传入失败/取消 attempt 已登记的 `artifacts/checkpoint-<step>.json`，并加 `--resume-training-state`。如果冻结计划还要求父 adapter，也要按其 adapter manifest 一并传入；checkpoint 提供模型权重和训练状态，父 adapter 用于验证 lineage。恢复要求训练 task、有效 job 配置、数据/模型输入指纹、父 adapter payload、DeepSpeed 配置和 GPU world size 与原 attempt 一致。不会搜索 latest checkpoint，也不会覆盖失败 attempt 的输出。终态 job 不能重新启动；低级入口不会重启终态 job，也不自动生成 retry 记录；恢复所需的新 planned job 记录由后续编排层负责创建。
+高级编排器恢复失败或中断的 tune run 时，使用 `--resume-from-run-dir <绝对 run 目录>`。它会在同一 experiment 中创建新的 recovery run 和独立输出目录，原失败/取消 run 与日志、checkpoint 保留；成功 job 仅在配置、外部输入和父 adapter 均匹配时复用已核验 adapter。失败 job 优先从已登记且完整的最高 global step checkpoint 恢复训练状态；只有任务、有效配置、数据/模型输入指纹、父 adapter、DeepSpeed 配置、冻结 GPU 分组和 world size 全部匹配时才使用该 checkpoint。没有匹配 checkpoint 时，独立任务从 base 开始，依赖任务从当前父 adapter 权重开始并重置 optimizer、scheduler、epoch 和 global step。若配置路径上的输入内容发生变化，新 run 会记录新的输入指纹，因此旧 checkpoint 和旧成功 adapter 都不会复用。恢复不会搜索 latest，也不会覆盖旧 attempt。恢复 run 成为 experiment 当前 tune run；此前 tune run 保存在 `retired_stage_runs` 中，以便审计和验证其 checkpoint provenance。
+
+低级单 job 入口仍通过 `--resume-training-state` 接收显式 checkpoint manifest；它不会自行选择 checkpoint 或重试终态 job。
 
 base、processor 和 annotation manifest 按冻结的 input_specs 自动生成并校验；内部 adapter/checkpoint 必须显式指定。每个 job 使用冻结 GPU 分组的零起始索引，设备在启动 torchrun 前解析为获准物理 GPU 的 UUID；物理 GPU 0 会被拒绝，SwanLab 回调只采集同一物理设备组。GPU、端口及高级 tune run 的并行槽位使用文件锁协调；端口为 `master_port + gpu_group_index`。job 同步执行并将 stdout/stderr 写入 `logs/train.log`。
 
