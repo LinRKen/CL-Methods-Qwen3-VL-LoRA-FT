@@ -322,6 +322,15 @@ def _register_outputs(job_dir, job, inputs, output, request):
     return {role: manifest["fingerprint"] for role, manifest in manifests}
 
 
+def _ensure_output_disjoint_from_protected_paths(output, protected_paths):
+    resolved_output = Path(output).resolve()
+    for path in protected_paths:
+        resolved_path = Path(path).resolve()
+        if (resolved_path == resolved_output or resolved_path in resolved_output.parents
+                or resolved_output in resolved_path.parents):
+            raise ValueError("Output must not overlap input payloads or experiment records")
+
+
 def execute_eval_job(job_dir, *, gpu_group_index=0, input_manifests=None):
     """Synchronously score all planned pairs with one shared judge-model load."""
     job_dir = Path(job_dir).expanduser().resolve(strict=True)
@@ -366,11 +375,14 @@ def execute_eval_job(job_dir, *, gpu_group_index=0, input_manifests=None):
                     stack.enter_context(_exclusive(Path("/tmp/qwen3vl-lora-tune-locks") /
                                         "physical-{}.lock".format(physical), blocking=True))
                 job, inputs, pairs = _inputs(job_dir, job, snapshot, input_manifests, experiment_dir)
-                for path in [Path(value["path"]) for value in inputs.values()] + [
-                        Path(config["experiment"]["dataset_root"]).resolve(strict=True), experiment_dir]:
-                    resolved_output = output.resolve()
-                    if path == resolved_output or path in resolved_output.parents or resolved_output in path.parents:
-                        raise ValueError("Output must not overlap input payloads or experiment records")
+                protected_paths = [Path(value["path"]) for value in inputs.values()]
+                protected_paths.extend([
+                    Path(config["experiment"]["dataset_root"]).resolve(strict=True),
+                    experiment_dir / "experiment.json",
+                    experiment_dir / "config.snapshot.json",
+                    experiment_dir / "stage-runs",
+                ])
+                _ensure_output_disjoint_from_protected_paths(output, protected_paths)
                 output.mkdir(parents=True, exist_ok=False)
                 owns_output = True
                 (output / "logs").mkdir()
