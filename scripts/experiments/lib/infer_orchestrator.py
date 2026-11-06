@@ -26,7 +26,7 @@ else:
     from ..pipeline import build_stage_plan
 
 SUPPORTED_SETTINGS = ("zero_shot", "multitask", "singletask", "cl",
-                      "transfer_round1", "transfer_round2")
+                      "transfer_round1", "transfer_round2", "transfer_baseline")
 
 
 def _context(run_dir):
@@ -101,7 +101,33 @@ def _context(run_dir):
                         "planned": item, "adapter": None, "initial_status": job["status"],
                         "resources": _resources(job_snapshot["config"], job_id)}
 
-    if setting != "zero_shot":
+    if setting == "transfer_baseline":
+        from .transfer_baseline import validate_transfer_baseline_source
+        frozen = snapshot["layers"].get("transfer_baseline_source")
+        if not isinstance(frozen, dict):
+            raise ValueError("Baseline infer run lacks its frozen source adapter binding")
+        actual = validate_transfer_baseline_source(snapshot, experiment_id)
+        if fingerprint(actual) != fingerprint(frozen):
+            raise ValueError("Baseline source adapters changed after plan preparation")
+        for job_id, info in jobs.items():
+            task = info["record"]["lineage"].get("baseline_source_task")
+            source = actual["adapters"].get(task)
+            job = info["record"]
+            if source is None:
+                raise ValueError("Baseline source adapter is missing: " + str(task))
+            expected = {"stage": "tune", "job_id": source["job_id"], "artifact_kind": "adapter",
+                        "slot": source["manifest"]["metadata"]["slot"], "experiment_id": actual["experiment_id"]}
+            if (job["requires"] != [expected]
+                    or job["tasks"] != list(TASKS)
+                    or job["lineage"].get("adapter_ref") != source["job_id"]
+                    or job["lineage"].get("adapter_source_experiment_id") != actual["experiment_id"]):
+                raise ValueError("Baseline infer job differs from its frozen adapter source: " + job_id)
+            info["adapter"] = {"manifest": source["manifest_path"], "path": source["manifest"]["path"],
+                               "fingerprint": source["manifest"]["fingerprint"],
+                               "producer": source["manifest"]["producer"],
+                               "slot": source["manifest"]["metadata"]["slot"]}
+            info["reusable_prediction_sources"] = deepcopy(job["lineage"].get("reusable_predictions", {}))
+    elif setting != "zero_shot":
         source_context = None
         if setting == "transfer_round2" and experiment_config.get("transfer_source_experiment_id"):
             source_context = validate_transfer_source(
@@ -207,6 +233,11 @@ def _audit_succeeded_job(info, dataset_root, verification_cache=None):
     job_dir, job = info["directory"], info["record"]
     tasks = job["tasks"]
     expected_inputs = {spec["role"] for spec in job["input_specs"]}
+    reusable_predictions = job.get("lineage", {}).get("reusable_predictions", {})
+    if info["snapshot"]["config"]["experiment"]["setting"] == "transfer_baseline":
+        expected_inputs.update("reuse-prediction-" + task for task in reusable_predictions)
+    elif reusable_predictions:
+        raise ValueError("Prediction reuse is only valid for transfer_baseline jobs")
     if info["adapter"] is not None:
         expected_inputs.add("adapter")
     if set(job["inputs"]) != expected_inputs:
@@ -215,6 +246,17 @@ def _audit_succeeded_job(info, dataset_root, verification_cache=None):
         check_manifest(manifest, verify_contents=True, verification_cache=verification_cache)
         if Path(manifest["requested_path"]).resolve(strict=True) != Path(manifest["path"]):
             raise ValueError("Succeeded infer input path was redirected: " + job["job_id"])
+    if reusable_predictions:
+        from .transfer_baseline import audit_reusable_prediction
+        source = info["snapshot"]["layers"].get("transfer_baseline_source")
+        if not isinstance(source, dict):
+            raise ValueError("Reused baseline predictions lack their frozen adapter source")
+        for task, candidate in reusable_predictions.items():
+            role = "reuse-prediction-" + task
+            if role not in job["inputs"]:
+                raise ValueError("A reusable baseline prediction input is missing: " + task)
+            audit_reusable_prediction(info["snapshot"], task, candidate, job["inputs"][role],
+                                      job["inputs"], source)
     for spec in job["input_specs"]:
         manifest = job["inputs"][spec["role"]]
         if (manifest["kind"] != spec["kind"]
@@ -294,7 +336,8 @@ def _audit_succeeded_job(info, dataset_root, verification_cache=None):
                 or metadata.get("processor_fingerprint") != job["inputs"]["processor"]["fingerprint"]
                 or metadata.get("adapter_fingerprint") != request["adapter_fingerprint"]
                 or metadata.get("params") != request["params"]
-                or metadata.get("model_loads_per_job") != 1
+                or metadata.get("model_loads_per_job") != request.get("model_loads", 1)
+                or metadata.get("reuse_source") != task_spec.get("reuse")
                 or metadata.get("annotation_fingerprint") != annotation["fingerprint"]):
             raise ValueError("Prediction artifact failed its complete test-set audit: " + task)
         inspected[task] = result
@@ -316,7 +359,8 @@ def _audit_succeeded_job(info, dataset_root, verification_cache=None):
             or summary.get("input_fingerprints") != request["input_fingerprints"]
             or summary.get("params") != request["params"]
             or summary.get("physical_gpu_ids") != request["physical_gpu_ids"]
-            or summary.get("model_loads") != 1 or summary.get("engine_shutdown") is not True
+            or summary.get("model_loads") != request.get("model_loads", 1)
+            or summary.get("engine_shutdown") is not True
             or summary.get("task_order") != tasks or not isinstance(summary.get("tasks"), list)
             or len(summary["tasks"]) != len(tasks)):
         raise ValueError("Inference summary is incomplete or inconsistent: " + job["job_id"])
@@ -384,6 +428,8 @@ def _launch(job_id, info, resource, repo_root, low_level, invocation_dir, receip
                "--gpu-group-index", str(resource["group_index"])]
     if manifest_path:
         command.extend(["--input", "adapter=" + manifest_path])
+    for task, candidate in job["lineage"].get("reusable_predictions", {}).items():
+        command.extend(["--input", "reuse-prediction-{}={}".format(task, candidate["manifest_path"])])
     environment = os.environ.copy()
     environment.update(CUDA_VISIBLE_DEVICES=",".join(map(str, resource["physical_gpu_ids"])),
                        CUDA_DEVICE_ORDER="PCI_BUS_ID", PYTHONUNBUFFERED="1")

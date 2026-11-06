@@ -110,7 +110,9 @@ def _context(job_dir):
             or job["depends_on"] or job["training_state_policy"] is not None or job["resume_training_state"]
             or job["output_spec"] != {"artifact_kind": "metrics", "slot": "combined"}
             or job["lineage"].get("judge_model") != config["experiment"]["judge_model"]
-            or job["lineage"].get("judge_model_loads") != 1):
+            or job["lineage"].get("judge_model_loads") !=
+               (1 if any(pair.get("reused_evaluation") is None
+                         for pair in job["lineage"].get("scoring_pairs", [])) else 0)):
         raise ValueError("Eval requires all scoring pairs and one judge load without training state")
     return job, snapshot, experiment_dir, run
 
@@ -263,7 +265,13 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir, verification_cache
                  "annotation_sha256": annotation["identity"]["sha256"],
                  "infer_params": deepcopy(source_snapshot["config"]["infer"]["params"]),
                  "output_dir": str(Path(job["output_dir"]) / "pairs" / pair_id(pair))}
-        prepare_pair(bound, experiment["repo_root"])
+        reusable = pair.get("reused_evaluation")
+        if reusable is not None:
+            bound["reused_evaluation"] = deepcopy(reusable)
+            from .transfer_baseline import audit_reusable_evaluation
+            audit_reusable_evaluation(snapshot, bound, reusable)
+        else:
+            prepare_pair(bound, experiment["repo_root"])
         bound_pairs.append(bound)
         used.add(role)
     if set(predictions) != used:
@@ -289,6 +297,8 @@ def _make_request(job, config, inputs, pairs, output, group, identity):
                "params": deepcopy(config["eval"]["params"]), "physical_gpu_ids": group, "gpu_identity": identity,
                "input_fingerprints": {role: value["fingerprint"] for role, value in inputs.items()},
                "output_dir": str(output), "pairs": deepcopy(pairs),
+               "model_loads": 1 if any(pair.get("reused_evaluation") is None for pair in pairs) else 0,
+               "reused_pair_ids": [pair["pair_id"] for pair in pairs if pair.get("reused_evaluation")],
                "judge_source_sha256": {name: sha256_file(source / name)
                                        for name in ("eval_cosine.py", "dataset_utils.py", "qwen_judge.py")}}
     return {**payload, "request_fingerprint": fingerprint(payload)}
@@ -307,7 +317,7 @@ def _register_outputs(job_dir, job, inputs, output, request, verification_cache=
               "input_fingerprints": request["input_fingerprints"], "params": request["params"],
               "judge_model_fingerprint": request["judge_model_fingerprint"],
               "judge_processor_fingerprint": request["judge_processor_fingerprint"],
-              "prompt_version": summary["prompt_version"], "judge_model_loads": 1}
+              "prompt_version": summary["prompt_version"], "judge_model_loads": request["model_loads"]}
     manifests = []
     for pair, result in zip(request["pairs"], summary["pairs"]):
         metadata = {**common, **{key: pair[key] for key in ("pair_id", "prediction_job", "prediction_slot",

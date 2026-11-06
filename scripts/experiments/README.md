@@ -102,6 +102,7 @@ run.gpu_groups 只能显式使用物理 GPU 1–3，各组不得重叠；物理 
 | singletask | 6 | 6 | 6 |
 | transfer_round1 | 36（第一轮 6 + 第二轮 30） | 30 | 30 |
 | transfer_round2 | 36（第一轮 6 + 第二轮 30） | 30 | 30 |
+| transfer_baseline | 0（引用已有 transfer_round1 第一轮 adapter） | 6 | 36 |
 
 CL 两个模板均使用 setting: cl，通过 task_order 控制训练顺序；cl_mhpnvg 默认为 motion、hypo、pattern、nav、view、geo。transfer_round1 测第二轮 adapter 在第一轮 task 上的表现；transfer_round2 测其在第二轮 task 上的表现。第一轮 adapter 也需保留，供第二轮分支使用。
 
@@ -379,6 +380,20 @@ Transfer-round1 和 Transfer-round2 使用相同的训练结构：第一轮在 m
 36 个 final adapter 分别保存在 `<checkpoints_root>/<experiment_id>/<run_id>/<job_id>/adapter/`，第一轮六个 adapter 保留供所有子 job 读取，子 job 不覆盖父产物。`tune-summary.json` 记录每个 job 的轮次、source/train task、父 adapter、状态、资源、输出和阻断原因；全部 36 个 job 成功且产物核对通过后，高级 tune run 才记为 succeeded。
 
 两个 setting 的区别在后续测试选择：Transfer-round1 将三十个第二轮 adapter 分别测试其第一轮 source task；Transfer-round2 测试其第二轮 target task。现有计划已保留该区别，本入口只执行 tune，infer/eval 仍保持 planned。默认 YAML 与 setting YAML 的参数核对留待最终阶段。
+
+## Transfer baseline
+
+transfer_baseline.yaml 不训练新权重。prepare 时通过 experiment.transfer_source_experiment_id 指定一个已完成 tune 的 transfer_round1 experiment。编排器复核其冻结 tune plan、六个 tune-round1-<task> job 和 adapter manifest，然后把这六个已登记 adapter 绑定到 baseline experiment；不会复制权重。
+
+Baseline infer 固定创建六个 job，每个 job 对应一个第一轮 source adapter，并在六个 test task 上推理；每个 adapter 只加载一次 vLLM，合计 36 格。baseline eval 将 36 个 prediction/GT pair 一次传给单个 Qwen judge job。结果矩阵行是第一轮训练 task，列是 test task，使用 combined_flat_rawacc 并保留 invalid 计数。
+
+示例：
+
+~~~bash
+/home/linruikang/data/envs/Qwen3VL-vLLM/bin/python scripts/experiments/pipeline.py prepare --config scripts/experiments/configs/transfer_baseline.yaml --set experiment.transfer_source_experiment_id=transfer-round1-example --experiment-id transfer-baseline-example
+~~~
+
+现有 transfer_round1 的 30 格来自第二轮 adapter 在 source task 上的推理；它没有使用第一轮 adapter，不能直接作为 baseline 的 source adapter 结果。baseline 的对角线只有在其他已有预测由完全相同的 adapter、推理配置、base/processor 和 GT 生成，并且其生产记录通过完整审计时才可复用。当前 baseline 仍走完整 36 对单次 judge 流程，不会把旧分数冒充为本次评测。
 
 ## CL 持续学习高级 tune
 

@@ -10,6 +10,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -113,12 +114,34 @@ def _request(path):
             or any(item["task"] not in TASKS for item in tasks)
             or len({item["task"] for item in tasks}) != len(tasks)):
         raise ValueError("Worker requires distinct planned test tasks")
+    reusable = request["lineage"].get("reusable_predictions", {})
+    expected_model_loads = 1 if any(item["task"] not in reusable for item in tasks) else 0
+    if request.get("model_loads", 1) != expected_model_loads:
+        raise ValueError("Inference model-load count differs from reused task coverage")
     for item in tasks:
         if (item["dataset"] != "cosine_{}_test".format(item["task"])
                 or Path(item["output_path"]) != output / "predictions" / (item["task"] + ".jsonl")
                 or not Path(item["annotation_path"]).is_absolute()
                 or sha256_file(item["annotation_path"]) != item["annotation_sha256"]):
             raise ValueError("Test task paths or annotation contents disagree with the request")
+        candidate = reusable.get(item["task"])
+        if candidate is None:
+            if item.get("reuse") is not None:
+                raise ValueError("Task reuse is not present in the frozen infer plan")
+        elif (item.get("reuse", {}).get("manifest_fingerprint") != candidate.get("manifest_fingerprint")
+              or item["reuse"].get("manifest") != candidate.get("manifest")
+              or item["reuse"].get("source") != candidate.get("source")
+              or item["reuse"].get("annotation_fingerprint") != candidate.get("annotation_fingerprint")
+              or item["reuse"].get("infer_params") != request["params"]
+              or candidate["manifest"].get("kind") != "prediction"
+              or candidate["manifest"].get("fingerprint") != candidate["manifest_fingerprint"]
+              or candidate["manifest"].get("metadata", {}).get("task") != item["task"]
+              or candidate["manifest"].get("metadata", {}).get("annotation_fingerprint")
+                 != candidate["annotation_fingerprint"]
+              or candidate["manifest"].get("identity", {}).get("sha256") is None
+              or sha256_file(candidate["manifest"]["path"])
+                 != candidate["manifest"]["identity"]["sha256"]):
+            raise ValueError("Frozen reusable prediction failed its content/lineage check")
         if Path(item["output_path"]).exists() or Path(item["output_path"]).is_symlink():
             raise FileExistsError("Refusing to overwrite predictions: " + item["output_path"])
     if (output / "inference_result.json").exists():
@@ -181,38 +204,57 @@ def execute_worker(request_path):
             for modality in limits:
                 limits[modality] = max(limits[modality], task_limits[modality])
             datasets.append((item, samples))
-        processor = legacy.load_processor(args)
-        summary["processor_sampling"] = _configure_processor(processor, request["params"])
-        adapter_config = legacy.load_adapter_config(args)
-        summary["media_limits"] = limits
-        with TemporaryDirectory(prefix="pipeline-vllm-model-") as directory:
-            model_directory = Path(directory)
-            legacy.prepare_model_directory(args, processor, model_directory)
-            engine, sampling, lora_request = legacy.load_engine(args, model_directory, limits, adapter_config)
-            summary["model_loads"] = 1
-            inference_error = None
-            try:
-                for item, samples in datasets:
-                    print("Running {} ({} samples) with the shared engine".format(
-                        item["dataset"], len(samples)), flush=True)
-                    legacy.run_inference(engine, processor, samples, item["dataset"],
-                                         Path(item["output_path"]), args, sampling, lora_request)
-                    summary["tasks"].append(inspect_predictions(item, samples, request["params"]))
-            except BaseException as error:
-                inference_error = error
-                raise
-            finally:
+        generated = [item for item in request["tasks"] if item.get("reuse") is None]
+        reused = [item for item in request["tasks"] if item.get("reuse") is not None]
+        (output / "predictions").mkdir(parents=True, exist_ok=True)
+        for item in reused:
+            source = item["reuse"]["manifest"]["path"]
+            target = Path(item["output_path"])
+            shutil.copyfile(source, target)
+            if sha256_file(target) != item["reuse"]["manifest"]["identity"]["sha256"]:
+                raise ValueError("Copied reusable prediction differs from its frozen manifest")
+            summary["tasks"].append(inspect_predictions(item, load_samples(item["annotation_path"], request["media_root"]),
+                                                         request["params"]))
+        engine = None
+        if generated:
+            processor = legacy.load_processor(args)
+            summary["processor_sampling"] = _configure_processor(processor, request["params"])
+            adapter_config = legacy.load_adapter_config(args)
+            summary["media_limits"] = limits
+            with TemporaryDirectory(prefix="pipeline-vllm-model-") as directory:
+                model_directory = Path(directory)
+                legacy.prepare_model_directory(args, processor, model_directory)
+                engine, sampling, lora_request = legacy.load_engine(args, model_directory, limits, adapter_config)
+                summary["model_loads"] = 1
+                inference_error = None
                 try:
-                    legacy.shutdown_vllm_engine(engine)
-                    summary["engine_shutdown"] = True
-                except Exception as error:
-                    summary["shutdown_error"] = str(error)
-                    if inference_error is None:
-                        raise
-                    print("vLLM shutdown failed: " + str(error), file=sys.stderr, flush=True)
+                    for item, samples in datasets:
+                        if item.get("reuse") is not None:
+                            continue
+                        print("Running {} ({} samples) with the shared engine".format(
+                            item["dataset"], len(samples)), flush=True)
+                        legacy.run_inference(engine, processor, samples, item["dataset"],
+                                             Path(item["output_path"]), args, sampling, lora_request)
+                        summary["tasks"].append(inspect_predictions(item, samples, request["params"]))
+                except BaseException as error:
+                    inference_error = error
+                    raise
                 finally:
-                    engine = None
-                    gc.collect()
+                    try:
+                        legacy.shutdown_vllm_engine(engine)
+                        summary["engine_shutdown"] = True
+                    except Exception as error:
+                        summary["shutdown_error"] = str(error)
+                        if inference_error is None:
+                            raise
+                        print("vLLM shutdown failed: " + str(error), file=sys.stderr, flush=True)
+                    finally:
+                        engine = None
+                        gc.collect()
+        else:
+            summary["engine_shutdown"] = True
+        task_order = [item["task"] for item in request["tasks"]]
+        summary["tasks"].sort(key=lambda item: task_order.index(item["task"]))
         for item in request["tasks"]:
             if sha256_file(item["annotation_path"]) != item["annotation_sha256"]:
                 raise ValueError("An annotation changed during inference")

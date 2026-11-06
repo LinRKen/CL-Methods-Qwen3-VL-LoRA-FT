@@ -111,7 +111,8 @@ def _context(job_dir):
             or not job["output_spec"] or job["output_spec"].get("artifact_kind") != "prediction"
             or job["output_spec"].get("tasks") != job["tasks"]
             or job["lineage"].get("test_tasks") != job["tasks"]
-            or job["lineage"].get("model_loads_per_job") != 1
+            or job["lineage"].get("model_loads_per_job") !=
+               (1 if set(job["tasks"]) - set(job["lineage"].get("reusable_predictions", {})) else 0)
             or job["training_state_policy"] is not None or job["resume_training_state"]):
         raise ValueError("An infer job requires distinct test tasks and one model load, without training state")
     for dependency in job["depends_on"]:
@@ -153,7 +154,11 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
                                             source=spec["source"], metadata=spec["metadata"])
     for role, manifest in inputs.items():
         check_manifest(manifest, verify_contents=True)
-        if role not in specs and manifest["kind"] != "adapter":
+        allowed_external = {"adapter"}
+        if experiment["setting"] == "transfer_baseline":
+            allowed_external.update("reuse-prediction-" + task
+                                    for task in job["lineage"].get("reusable_predictions", {}))
+        if role not in specs and role not in allowed_external:
             raise ValueError("Unexpected infer input role: " + role)
     for role, spec in specs.items():
         manifest = inputs.get(role)
@@ -167,6 +172,21 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
     expected_adapters = 0 if experiment["setting"] == "zero_shot" else 1
     if len(adapters) != expected_adapters or len(job["requires"]) != expected_adapters:
         raise ValueError("Infer requires exactly one planned adapter, or none for Zero-shot")
+    reusable = job["lineage"].get("reusable_predictions", {})
+    reuse_roles = {"reuse-prediction-" + task for task in reusable}
+    actual_reuse_roles = {role for role, manifest in inputs.items() if manifest["kind"] == "prediction"}
+    if experiment["setting"] == "transfer_baseline":
+        if actual_reuse_roles != reuse_roles:
+            raise ValueError("Baseline reuse inputs differ from the frozen per-task candidate list")
+        from .transfer_baseline import audit_reusable_prediction
+        source = snapshot["layers"].get("transfer_baseline_source")
+        for task, candidate in reusable.items():
+            audit_reusable_prediction(snapshot, task, candidate, inputs["reuse-prediction-" + task],
+                                      inputs, source)
+    elif actual_reuse_roles:
+        raise ValueError("Prediction reuse inputs are supported only by transfer_baseline")
+    if set(inputs) != set(specs) | ({"adapter"} if adapters else set()) | reuse_roles:
+        raise ValueError("Infer input roles differ from the frozen adapter and reuse plan")
     if experiment["setting"] == "transfer_round2" and experiment.get("transfer_source_experiment_id"):
         source_context = validate_transfer_source(
             snapshot, job["experiment_id"], audit_adapters=False, require_frozen=True,
@@ -178,7 +198,23 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
         reference_source = reference.get("experiment_id", job["experiment_id"])
         if reference_source != expected_source:
             raise ValueError("Infer adapter source differs from its frozen lineage")
-    _require_internal_inputs(job, inputs, experiment_dir)
+    if experiment["setting"] == "transfer_baseline":
+        from .tune_executor import _registered_producer
+        for adapter in adapters:
+            source_job = _registered_producer(adapter, experiment["records_root"])
+            producer = adapter["producer"]
+            source_dir = (Path(experiment["records_root"]) / producer["experiment_id"]
+                          / "stage-runs/tune" / producer["run_id"] / "jobs" / producer["job_id"])
+            registered, source_snapshot = load_job(source_dir)
+            _adapter_config(adapter["path"], source_snapshot["config"]["tune"]["params"],
+                            inputs["base-model"]["path"])
+            if (registered["status"] != "succeeded"
+                    or job["lineage"].get("adapter_ref") != producer["job_id"]
+                    or adapter["metadata"].get("base_model_fingerprint") != inputs["base-model"]["fingerprint"]
+                    or registered["job_id"] != producer["job_id"]):
+                raise ValueError("Baseline adapter source or base model differs")
+    else:
+        _require_internal_inputs(job, inputs, experiment_dir)
     for adapter in adapters:
         source = _registered_producer(adapter, experiment["records_root"])
         producer = adapter["producer"]
@@ -259,13 +295,26 @@ def _make_request(job, config, inputs, output, group, identity):
                "params": deepcopy(config["infer"]["params"]),
                "physical_gpu_ids": group, "gpu_identity": identity,
                "input_fingerprints": {role: value["fingerprint"] for role, value in inputs.items()},
-               "output_dir": str(output), "tasks": []}
+               "output_dir": str(output),
+               "model_loads": 1 if set(job["tasks"]) - set(job["lineage"].get("reusable_predictions", {})) else 0,
+               "tasks": []}
+    reusable = job["lineage"].get("reusable_predictions", {})
     for task in job["tasks"]:
         annotation = inputs["annotation-{}-test".format(task)]
-        payload["tasks"].append({"task": task, "dataset": "cosine_{}_test".format(task),
-                                 "annotation_path": annotation["path"],
-                                 "annotation_sha256": annotation["identity"]["sha256"],
-                                 "output_path": str(output / "predictions" / (task + ".jsonl"))})
+        task_spec = {"task": task, "dataset": "cosine_{}_test".format(task),
+                     "annotation_path": annotation["path"],
+                     "annotation_sha256": annotation["identity"]["sha256"],
+                     "output_path": str(output / "predictions" / (task + ".jsonl"))}
+        if task in reusable:
+            role = "reuse-prediction-" + task
+            candidate = reusable[task]
+            task_spec["reuse"] = {"manifest_path": candidate["manifest_path"],
+                                  "manifest_fingerprint": inputs[role]["fingerprint"],
+                                  "manifest": deepcopy(inputs[role]),
+                                  "source": deepcopy(candidate["source"]),
+                                  "annotation_fingerprint": candidate["annotation_fingerprint"],
+                                  "infer_params": deepcopy(candidate["infer_params"])}
+        payload["tasks"].append(task_spec)
     return {**payload, "request_fingerprint": fingerprint(payload)}
 
 
@@ -279,7 +328,8 @@ def _register_outputs(job_dir, job, config, inputs, output, request):
             or summary.get("input_fingerprints") != request["input_fingerprints"]
             or summary.get("params") != request["params"]
             or summary.get("physical_gpu_ids") != request["physical_gpu_ids"]
-            or summary.get("model_loads") != 1 or summary.get("engine_shutdown") is not True
+            or summary.get("model_loads") != (1 if any(item.get("reuse") is None for item in request["tasks"]) else 0)
+            or summary.get("engine_shutdown") is not True
             or summary.get("task_order") != tasks or not isinstance(summary.get("tasks"), list)
             or len(summary["tasks"]) != len(tasks)):
         raise ValueError("Inference summary is incomplete or describes another execution")
@@ -304,7 +354,8 @@ def _register_outputs(job_dir, job, config, inputs, output, request):
                     "adapter_fingerprint": request["adapter_fingerprint"],
                     "annotation_fingerprint": inputs["annotation-{}-test".format(task)]["fingerprint"],
                     "request_fingerprint": request["request_fingerprint"],
-                    "params": request["params"], "model_loads_per_job": 1}
+                    "params": request["params"], "model_loads_per_job": request["model_loads"],
+                    "reuse_source": deepcopy(task_spec.get("reuse"))}
         manifests.append(("prediction-" + task, make_manifest("prediction", task_spec["output_path"],
                          producer=request["producer"], metadata=metadata)))
     manifests.append(("inference-summary", make_manifest("summary", output / "inference_result.json",

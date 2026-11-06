@@ -5,6 +5,7 @@ Inspection helpers remain usable without CUDA or a model load.
 """
 
 import argparse
+from copy import deepcopy
 import gc
 import hashlib
 import importlib
@@ -12,6 +13,7 @@ import json
 import os
 from pathlib import Path
 import signal
+import shutil
 import sys
 import time
 
@@ -109,10 +111,99 @@ def _devices(request):
             for physical, uuid, pci in zip(request["physical_gpu_ids"], identity["uuids"], identity["pci_bus_ids"])]
 
 
+def _inspect_reused_pair(request, pair, records):
+    """Import already-audited raw judge outputs without loading Qwen again."""
+    reuse = pair["reused_evaluation"]
+    source_request_path = Path(reuse["source_request_path"])
+    if sha256_file(source_request_path) != reuse["source_request_sha256"]:
+        raise ValueError("Reusable judge request changed after baseline preparation")
+    source_request = read_json(source_request_path)
+    source_pair = next((item for item in source_request.get("pairs", [])
+                        if item.get("pair_id") == reuse["source_pair_id"]), None)
+    if (source_pair != reuse["source_pair"]
+            or source_pair is None
+            or source_pair.get("prediction_sha256") != pair["prediction_sha256"]
+            or source_pair.get("annotation_fingerprint") != pair["annotation_fingerprint"]
+            or source_request.get("params") != request["params"]
+            or source_request.get("judge_model_fingerprint") != request["judge_model_fingerprint"]
+            or source_request.get("judge_processor_fingerprint") != request["judge_processor_fingerprint"]
+            or source_request.get("judge_source_sha256") != request["judge_source_sha256"]):
+        raise ValueError("Reusable judge source does not match the current prediction and judge")
+    source_result, source_scored = inspect_pair(source_request, source_pair)
+    source_records = prepare_pair(source_pair, request["repo_root"])
+    if fingerprint(source_records) != fingerprint(records):
+        raise ValueError("Reusable judge source records differ from the baseline prediction/GT")
+    for name, item in reuse["artifacts"].items():
+        if sha256_file(item["path"]) != item["sha256"]:
+            raise ValueError("Reusable judge artifact changed: " + name)
+    source_hashes = {name: sha256_file(item["path"]) for name, item in reuse["artifacts"].items()}
+    expected_names = {"judge.raw.jsonl", "judge.scored.jsonl", "judge.metrics.json"}
+    if set(source_hashes) != expected_names:
+        raise ValueError("Reusable judge candidate is missing pair artifacts")
+    target = Path(pair["output_dir"])
+    paths = {name: target / name for name in reuse["artifacts"]}
+    if not target.exists():
+        target.mkdir(parents=True, exist_ok=False)
+        for name, item in reuse["artifacts"].items():
+            shutil.copyfile(item["path"], paths[name])
+            if sha256_file(paths[name]) != item["sha256"]:
+                raise ValueError("Imported judge artifact copy failed verification: " + name)
+    elif not target.is_dir() or target.is_symlink() or any(not path.is_file() for path in paths.values()):
+        raise ValueError("Existing reused judge output is incomplete or redirected")
+    source_metrics = read_json(paths["judge.metrics.json"])
+    if (source_metrics.get("run") != reuse["run"]
+            or source_metrics.get("run_fingerprint") != reuse["run_fingerprint"]
+            or source_result.get("combined_flat_rawacc") != source_metrics.get("combined_flat_rawacc")):
+        raise ValueError("Imported judge metrics differ from their frozen source")
+    expected_metrics = {**source_metrics, "raw_file": str(paths["judge.raw.jsonl"]),
+                        "scored_file": str(paths["judge.scored.jsonl"])}
+    if source_metrics != expected_metrics:
+        write_json_atomic(paths["judge.metrics.json"], expected_metrics)
+    if read_json(paths["judge.metrics.json"]) != expected_metrics:
+        raise ValueError("Imported judge metrics paths could not be rebound to the baseline output")
+
+    legacy = _legacy(request["repo_root"])
+    run = source_metrics["run"]
+    _validate_run(legacy, source_request, source_pair, run)
+    run_fingerprint = _run_fingerprint(run)
+    if run_fingerprint != reuse["run_fingerprint"]:
+        raise ValueError("Imported judge raw run fingerprint differs")
+    done = legacy.restore_raw(paths["judge.raw.jsonl"], records, run, run_fingerprint)
+    if set(done) != set(range(len(records))):
+        raise ValueError("Imported judge raw file does not cover the full baseline pair")
+    if any(row.get("physical_gpus") != _devices(source_request)
+           or not isinstance(row.get("completed_at"), str) or not row["completed_at"] for row in done.values()):
+        raise ValueError("Imported judge raw file lacks valid source device evidence")
+    scored = [legacy.scored_record(record, done[record["inference_index"]]["parsed"],
+                                   done[record["inference_index"]]["parse_error"]) for record in records]
+    if fingerprint(legacy.read_jsonl(paths["judge.scored.jsonl"])) != fingerprint(scored):
+        raise ValueError("Imported judge scores differ from the source raw judgments")
+    expected = legacy.aggregate_metrics(scored)
+    expected.update(run=run, run_fingerprint=run_fingerprint,
+                    judge_parse_failures=sum(row["judge_parse_error"] is not None for row in scored),
+                    raw_file=str(paths["judge.raw.jsonl"]), scored_file=str(paths["judge.scored.jsonl"]))
+    metrics = read_json(paths["judge.metrics.json"])
+    if (set(metrics) != set(expected) | {"completed_at"}
+            or not isinstance(metrics["completed_at"], str) or not metrics["completed_at"]
+            or any(fingerprint(metrics.get(key)) != fingerprint(value) for key, value in expected.items())):
+        raise ValueError("Imported judge metrics do not match its raw/scored files")
+    result = {key: pair[key] for key in ("pair_id", "prediction_job", "prediction_slot", "task", "dataset",
+              "prediction_fingerprint", "annotation_fingerprint")}
+    result.update({key: metrics[key] for key in ("total", "valid", "invalid", "score_sum",
+                   "combined_flat_rawacc", "judge_parse_failures")})
+    result.update(output_dir=str(target), run_fingerprint=run_fingerprint,
+                  reused_from=deepcopy(reuse["source"]),
+                  artifacts={name: {"path": str(path), "sha256": sha256_file(path)}
+                             for name, path in paths.items()})
+    return result, scored
+
+
 def inspect_pair(request, pair):
     """Reparse raw judgments and recompute scores; never call the judge model."""
     legacy = _legacy(request["repo_root"])
     records = prepare_pair(pair, request["repo_root"])
+    if pair.get("reused_evaluation") is not None:
+        return _inspect_reused_pair(request, pair, records)
     directory = Path(pair["output_dir"])
     raw_path, scored_path, metrics_path = (directory / name for name in legacy.ARTIFACTS)
     metrics = read_json(metrics_path)
@@ -174,7 +265,7 @@ def inspect_evaluation(request):
         raise ValueError("Combined metrics differ from the complete ordered pair results")
     summary = read_json(output / "evaluation_result.json")
     fields = {**expected, "status": "succeeded", "physical_gpu_ids": request["physical_gpu_ids"],
-              "gpu_identity": request["gpu_identity"], "model_loads": 1, "engine_shutdown": True,
+              "gpu_identity": request["gpu_identity"], "model_loads": request.get("model_loads", 1), "engine_shutdown": True,
               "metrics_file": str(output / "judge.metrics.json"),
               "metrics_sha256": sha256_file(output / "judge.metrics.json")}
     if (set(summary) != set(fields) | {"started_at", "finished_at", "elapsed_seconds"}
@@ -207,6 +298,9 @@ def _request(path):
     if not output.is_absolute() or not output.is_dir() or output.is_symlink():
         raise ValueError("Worker requires the executor-created output directory")
     pairs = request["pairs"]
+    expected_loads = 1 if any(pair.get("reused_evaluation") is None for pair in pairs) else 0
+    if request.get("model_loads", 1) != expected_loads:
+        raise ValueError("Judge model-load count differs from reused pair coverage")
     if (not isinstance(pairs, list) or not pairs
             or len({pair["pair_id"] for pair in pairs}) != len(pairs)
             or len(pairs) != len(request["lineage"]["scoring_pairs"])):
@@ -237,58 +331,70 @@ def execute_worker(request_path):
     try:
         legacy = _legacy(request["repo_root"])
         model = Path(request["judge_model"])
-        processor = legacy.load_processor(model)
         prepared = []
-        # Preflight every GT alignment and prompt before allocating the model engine.
         for pair in request["pairs"]:
             records = prepare_pair(pair, request["repo_root"])
+            if pair.get("reused_evaluation") is not None:
+                result, _ = _inspect_reused_pair(request, pair, records)
+                summary["pairs"].append({"pair_id": pair["pair_id"], "total": result["total"],
+                                         "combined_flat_rawacc": result["combined_flat_rawacc"]})
+                continue
             args = argparse.Namespace(**request["params"], dataset=pair["dataset"])
             run, run_fingerprint = _make_run(legacy, request, pair, args)
-            prompts = {row["inference_index"]: legacy.make_prompt(processor, legacy.build_messages(row),
-                       args, row["inference_index"]) for row in records}
-            prepared.append((pair, records, args, run, run_fingerprint, prompts))
-        engine, sampling = legacy.load_engine(argparse.Namespace(**request["params"]), model)
-        summary["model_loads"] = 1
-        evaluation_error = None
-        try:
-            for pair, records, args, run, run_fingerprint, prompts in prepared:
-                directory = Path(pair["output_dir"])
-                directory.mkdir(parents=True, exist_ok=False)
-                raw_path, scored_path, metrics_path = (directory / name for name in legacy.ARTIFACTS)
-                done = {}
-                print("Judging {} ({} samples) with the shared engine".format(pair["pair_id"], len(records)), flush=True)
-                with raw_path.open("x", encoding="utf-8") as handle:
-                    for offset in range(0, len(records), args.batch_size):
-                        legacy.judge_batch(engine, sampling, processor, records[offset:offset + args.batch_size],
-                                           prompts, args, handle, done, run, run_fingerprint, _devices(request), len(records))
-                if set(done) != set(range(len(records))):
-                    raise ValueError("Judge did not produce every planned sample")
-                scored = [legacy.scored_record(row, done[row["inference_index"]]["parsed"],
-                          done[row["inference_index"]]["parse_error"]) for row in records]
-                metrics = legacy.aggregate_metrics(scored)
-                metrics.update(run=run, run_fingerprint=run_fingerprint, completed_at=utc_now(),
-                               judge_parse_failures=sum(row["judge_parse_error"] is not None for row in scored),
-                               raw_file=str(raw_path), scored_file=str(scored_path))
-                legacy.write_json_atomic(scored_path, scored, jsonl=True)
-                write_json_atomic(metrics_path, metrics)
-                summary["pairs"].append({"pair_id": pair["pair_id"], "total": len(scored),
-                                         "combined_flat_rawacc": metrics["combined_flat_rawacc"]})
-        except BaseException as error:
-            evaluation_error = error
-            raise
-        finally:
+            prepared.append((pair, records, args, run, run_fingerprint, None))
+        if prepared:
+            processor = legacy.load_processor(model)
+            runtime = []
+            for pair, records, args, run, run_fingerprint, _ in prepared:
+                prompts = {row["inference_index"]: legacy.make_prompt(processor, legacy.build_messages(row),
+                           args, row["inference_index"]) for row in records}
+                runtime.append((pair, records, args, run, run_fingerprint, prompts))
+            engine, sampling = legacy.load_engine(argparse.Namespace(**request["params"]), model)
+            summary["model_loads"] = 1
+            evaluation_error = None
             try:
-                legacy.shutdown_engine(engine)
-                summary["engine_shutdown"] = True
-            except Exception as error:
-                summary["shutdown_error"] = str(error)
-                if evaluation_error is None:
-                    raise
-                print("vLLM shutdown failed: " + str(error), file=sys.stderr, flush=True)
+                for pair, records, args, run, run_fingerprint, prompts in runtime:
+                    directory = Path(pair["output_dir"])
+                    directory.mkdir(parents=True, exist_ok=False)
+                    raw_path, scored_path, metrics_path = (directory / name for name in legacy.ARTIFACTS)
+                    done = {}
+                    print("Judging {} ({} samples) with the shared engine".format(pair["pair_id"], len(records)), flush=True)
+                    with raw_path.open("x", encoding="utf-8") as handle:
+                        for offset in range(0, len(records), args.batch_size):
+                            legacy.judge_batch(engine, sampling, processor, records[offset:offset + args.batch_size],
+                                               prompts, args, handle, done, run, run_fingerprint,
+                                               _devices(request), len(records))
+                    if set(done) != set(range(len(records))):
+                        raise ValueError("Judge did not produce every planned sample")
+                    scored = [legacy.scored_record(row, done[row["inference_index"]]["parsed"],
+                              done[row["inference_index"]]["parse_error"]) for row in records]
+                    metrics = legacy.aggregate_metrics(scored)
+                    metrics.update(run=run, run_fingerprint=run_fingerprint, completed_at=utc_now(),
+                                   judge_parse_failures=sum(row["judge_parse_error"] is not None for row in scored),
+                                   raw_file=str(raw_path), scored_file=str(scored_path))
+                    legacy.write_json_atomic(scored_path, scored, jsonl=True)
+                    write_json_atomic(metrics_path, metrics)
+                    summary["pairs"].append({"pair_id": pair["pair_id"], "total": len(scored),
+                                             "combined_flat_rawacc": metrics["combined_flat_rawacc"]})
+            except BaseException as error:
+                evaluation_error = error
+                raise
             finally:
-                engine = None
-                gc.collect()
+                try:
+                    legacy.shutdown_engine(engine)
+                    summary["engine_shutdown"] = True
+                except Exception as error:
+                    summary["shutdown_error"] = str(error)
+                    if evaluation_error is None:
+                        raise
+                    print("vLLM shutdown failed: " + str(error), file=sys.stderr, flush=True)
+                finally:
+                    engine = None
+                    gc.collect()
+        else:
+            summary["engine_shutdown"] = True
         _check_sources(request)
+        summary["pairs"].sort(key=lambda item: [pair["pair_id"] for pair in request["pairs"]].index(item["pair_id"]))
         results, all_scored = [], []
         for pair in request["pairs"]:
             result, scored = inspect_pair(request, pair)

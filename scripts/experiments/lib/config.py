@@ -10,7 +10,8 @@ import yaml
 from .common import SCHEMA_VERSION, STAGES, TASKS, fingerprint, require_id
 
 DEFAULT_CONFIG = Path(__file__).resolve().parents[1] / "configs" / "default.yaml"
-SETTINGS = ("cl", "zero_shot", "multitask", "singletask", "transfer_round1", "transfer_round2")
+SETTINGS = ("cl", "zero_shot", "multitask", "singletask", "transfer_round1", "transfer_round2",
+            "transfer_baseline")
 
 
 class ConfigError(ValueError):
@@ -212,9 +213,14 @@ def validate_config(value, partial=False):
     if experiment["setting"] == "zero_shot" and "tune" in experiment["enabled_stages"]:
         _fail("experiment.enabled_stages", "zero_shot cannot enable tune")
     source_id = experiment.get("transfer_source_experiment_id")
-    if source_id is not None and experiment["setting"] != "transfer_round2":
+    if source_id is not None and experiment["setting"] not in ("transfer_round2", "transfer_baseline"):
         _fail("experiment.transfer_source_experiment_id",
-              "is supported only for transfer_round2")
+              "is supported only for transfer_round2 and transfer_baseline")
+    if experiment["setting"] == "transfer_baseline":
+        if source_id is None:
+            _fail("experiment.transfer_source_experiment_id", "is required for the six first-round adapters")
+        if experiment["enabled_stages"] != ["infer", "eval"]:
+            _fail("experiment.enabled_stages", "transfer_baseline requires [infer, eval] and does not train")
     if experiment["setting"] == "transfer_round2":
         if source_id is not None and "tune" in experiment["enabled_stages"]:
             _fail("experiment.enabled_stages",

@@ -1,0 +1,7 @@
+# Uses the six first-round adapters from an existing Transfer-round1 tune run.
+experiment:
+  name: transfer-baseline
+  setting: transfer_baseline
+  enabled_stages: [infer, eval]
+  # Required at prepare time:
+  # --set experiment.transfer_source_experiment_id=<transfer-round1-experiment-id>
