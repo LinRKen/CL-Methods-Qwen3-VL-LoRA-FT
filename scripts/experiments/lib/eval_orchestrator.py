@@ -79,7 +79,9 @@ def _context(run_dir):
             or job_snapshot["config"]["experiment"] != settings
             or job["training_state_policy"] is not None or job["resume_training_state"]
             or job["tasks"] != list(TASKS) or job["task"] is not None or job["depends_on"]
-            or job["lineage"].get("judge_model_loads") != 1
+            or job["lineage"].get("judge_model_loads") !=
+               (1 if any(pair.get("reused_evaluation") is None
+                         for pair in plan["jobs"][0]["lineage"]["scoring_pairs"]) else 0)
             or job["output_spec"] != {"artifact_kind": "metrics", "slot": "combined"}
             or Path(job["output_dir"]) != Path(run["output_root"]) / job["job_id"]
             or job["status"] not in ("planned", "succeeded")):
@@ -117,8 +119,19 @@ def _bind_predictions(info, experiment_dir, experiment, experiment_snapshot):
             or source_run["jobs"] != [{"job_id": item["job_id"], "path": "jobs/" + item["job_id"]}
                                       for item in plan["jobs"]]):
         raise ValueError("Successful infer registration differs from its complete frozen plan")
-    expected_pairs = [{"prediction_job": item["job_id"], "prediction_slot": item["output"]["slot"], "task": task}
-                      for item in plan["jobs"] for task in item["tasks"]]
+    expected_pairs = []
+    reusable_evaluations = info["snapshot"]["layers"].get("transfer_baseline_reuse", {}).get("evaluations", {})
+    for item in plan["jobs"]:
+        for task in item["tasks"]:
+            pair = {"prediction_job": item["job_id"],
+                    "prediction_slot": item["output"]["slot"], "task": task}
+            if settings["setting"] == "transfer_baseline":
+                source_task = item["lineage"]["baseline_source_task"]
+                pair["baseline_source_task"] = source_task
+                reusable = reusable_evaluations.get(source_task + "--" + task)
+                if reusable is not None:
+                    pair["reused_evaluation"] = reusable
+            expected_pairs.append(pair)
     pairs = info["record"]["lineage"]["scoring_pairs"]
     if pairs != expected_pairs:
         raise ValueError("Eval scoring pairs do not cover the exact successful infer plan in order")
@@ -238,7 +251,7 @@ def _audit_succeeded_job(info, experiment_dir, verification_cache=None):
               "request_fingerprint": request["request_fingerprint"], "input_fingerprints": request["input_fingerprints"],
               "params": request["params"], "judge_model_fingerprint": request["judge_model_fingerprint"],
               "judge_processor_fingerprint": request["judge_processor_fingerprint"],
-              "prompt_version": summary["prompt_version"], "judge_model_loads": 1}
+              "prompt_version": summary["prompt_version"], "judge_model_loads": request.get("model_loads", 1)}
     expected_outputs = {}
     for pair, result in zip(pairs, summary["pairs"]):
         metadata = {**common, **{key: pair[key] for key in
@@ -367,6 +380,8 @@ def _result_rows(info, experiment_config):
         slot, task = result["prediction_slot"], result["task"]
         if setting in ("transfer_round1", "transfer_round2"):
             row_key, column_key = lineage["source_task"], lineage["second_round_task"]
+        elif setting == "transfer_baseline":
+            row_key, column_key = lineage["baseline_source_task"], task
         else:
             row_key, column_key = slot, task
         metric_role = "pair-metrics-" + result["pair_id"]
@@ -374,16 +389,19 @@ def _result_rows(info, experiment_config):
         annotation = info["record"]["inputs"]["annotation-{}-test".format(task)]
         rows.append({**deepcopy(result), "setting": setting,
                      "matrix_row": row_key, "matrix_column": column_key,
-                     "train_task": slot if setting in ("cl", "singletask", "multitask")
+                     "train_task": (row_key if setting == "transfer_baseline" else slot)
+                     if setting in ("cl", "singletask", "multitask", "transfer_baseline")
                      else lineage.get("second_round_task"),
                      "cl_stage": order.index(slot) + 1 if setting == "cl" else None,
-                     "source_task": lineage.get("source_task"),
+                     "source_task": lineage.get("source_task", lineage.get("baseline_source_task")),
                      "second_round_task": lineage.get("second_round_task"),
                      "test_task": task, "adapter_ref": lineage.get("adapter_ref"),
                      "infer_lineage": deepcopy(lineage),
                      "adapter": deepcopy(adapter),
                      "adapter_manifest": adapter_path,
                      "prediction_producer": prediction["producer"],
+                     "prediction_reuse_source": deepcopy(prediction["metadata"].get("reuse_source")),
+                     "evaluation_reuse_source": deepcopy(result.get("reused_from")),
                      "prediction_manifest": str(source["directory"] / "artifacts" / ("prediction-" + task + ".json")),
                      "prediction_path": prediction["path"], "annotation_path": annotation["path"],
                      "metrics_manifest": str(info["directory"] / "artifacts" / (metric_role + ".json")),
@@ -396,7 +414,7 @@ def _result_rows(info, experiment_config):
 
 def _matrix(rows, experiment_config):
     setting = experiment_config["setting"]
-    row_order = (list(experiment_config["task_order"]) if setting == "cl" else
+    row_order = (list(experiment_config["task_order"]) if setting in ("cl", "transfer_baseline") else
                  ["base"] if setting == "zero_shot" else ["whole"] if setting == "multitask" else list(TASKS))
     columns = list(TASKS)
     values = [[None for _ in columns] for _ in row_order]
@@ -414,13 +432,15 @@ def _matrix(rows, experiment_config):
                 if setting in ("zero_shot", "multitask", "cl")
                 or (setting == "singletask" and ri == ci)
                 or (setting in ("transfer_round1", "transfer_round2") and ri != ci)}
+    if setting == "transfer_baseline":
+        expected = {(ri, ci) for ri in range(len(row_order)) for ci in range(len(columns))}
     populated = {(ri, ci) for ri, line in enumerate(pair_ids) for ci, value in enumerate(line) if value is not None}
     if populated != expected:
         raise ValueError("Result matrix does not cover every planned setting cell")
     return {"metric": "combined_flat_rawacc", "unit": "fraction", "row_order": row_order,
             "column_order": columns,
             "row_axis": "source_task" if setting.startswith("transfer_") else "adapter_slot",
-            "column_axis": "second_round_task" if setting.startswith("transfer_") else "test_task",
+            "column_axis": "second_round_task" if setting in ("transfer_round1", "transfer_round2") else "test_task",
             "test_task_rule": "source_task" if setting == "transfer_round1" else
                               "second_round_task" if setting == "transfer_round2" else "column_task",
             "values": values, "sample_counts": counts, "pair_ids": pair_ids,
@@ -466,7 +486,8 @@ def _publish_results(info, invocation_dir, experiment_config):
     write_json_atomic(invocation_dir / "matrix.json", matrix)
     fields = ["pair_id", "setting", "prediction_job", "prediction_slot", "cl_stage", "train_task",
               "source_task", "second_round_task", "test_task", "matrix_row", "matrix_column", *keys,
-              "adapter_ref", "adapter_manifest", "prediction_manifest", "prediction_path",
+              "adapter_ref", "adapter_manifest", "prediction_reuse_source", "evaluation_reuse_source",
+              "prediction_manifest", "prediction_path",
               "annotation_path", "metrics_manifest", "prediction_fingerprint", "annotation_fingerprint",
               "metrics_fingerprint", "output_dir"]
     buffer = io.StringIO(newline="")

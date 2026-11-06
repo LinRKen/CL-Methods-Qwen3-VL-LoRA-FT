@@ -171,12 +171,14 @@ def _tune_jobs(config):
                     "training_state": "fresh_optimizer_scheduler_epoch_global_step",
                 }, output={"artifact_kind": "adapter", "slot": "round2-{}-to-{}".format(source, target)}))
         return jobs
+    if setting == "transfer_baseline":
+        return []
     if setting == "zero_shot":
         return []
     raise ConfigError("Unsupported setting: {}".format(setting))
 
 
-def _infer_jobs(config):
+def _infer_jobs(config, baseline_source=None, baseline_reuse=None):
     experiment = config["experiment"]
     setting = experiment["setting"]
     if setting == "zero_shot":
@@ -243,22 +245,62 @@ def _infer_jobs(config):
                     output={"artifact_kind": "prediction", "slot": slot},
                 ))
         return jobs
+    if setting == "transfer_baseline":
+        if not isinstance(baseline_source, dict):
+            raise ConfigError("transfer_baseline requires a frozen source binding")
+        jobs = []
+        reusable_predictions = (baseline_reuse or {}).get("predictions", {})
+        for source_task in TASKS:
+            source = baseline_source["adapters"][source_task]
+            reuse_for_job = {}
+            for task in TASKS:
+                candidate = reusable_predictions.get(source_task + "--" + task)
+                if candidate is not None:
+                    reuse_for_job[task] = {
+                        "manifest": candidate["manifest"],
+                        "manifest_path": candidate["manifest_path"],
+                        "manifest_fingerprint": candidate["manifest"]["fingerprint"],
+                        "source": candidate["source"],
+                        "source_task": source_task,
+                        "annotation_fingerprint": candidate["annotation_fingerprint"],
+                        "infer_params": candidate["infer_params"],
+                    }
+            jobs.append(_job(
+                "infer-baseline-" + source_task,
+                tasks=list(TASKS),
+                input_specs=_infer_input_specs(experiment, TASKS),
+                requires=[_artifact_ref("tune", source["job_id"], "adapter",
+                                         slot=source["manifest"]["metadata"]["slot"],
+                                         experiment_id=baseline_source["experiment_id"])],
+                lineage={"adapter_ref": source["job_id"],
+                         "adapter_source_experiment_id": baseline_source["experiment_id"],
+                         "baseline_source_task": source_task,
+                         "reusable_predictions": reuse_for_job,
+                         "test_tasks": list(TASKS),
+                         "model_loads_per_job": 1 if len(reuse_for_job) < len(TASKS) else 0},
+                output={"artifact_kind": "prediction", "slot": source["manifest"]["metadata"]["slot"]}))
+        return jobs
     raise ConfigError("Unsupported setting: {}".format(setting))
 
 
-def _eval_jobs(config):
-    inference_jobs = _infer_jobs(config)
+def _eval_jobs(config, baseline_source=None, baseline_reuse=None):
+    inference_jobs = _infer_jobs(config, baseline_source, baseline_reuse)
+    reusable_evaluations = (baseline_reuse or {}).get("evaluations", {})
     scoring_pairs = []
     prediction_refs = []
     for item in inference_jobs:
         output_slot = item["output"]["slot"]
         for task in item.get("tasks", []):
             prediction_refs.append(_artifact_ref("infer", item["job_id"], "prediction", slot=output_slot, task=task))
-            scoring_pairs.append({
-                "prediction_job": item["job_id"],
-                "prediction_slot": output_slot,
-                "task": task,
-            })
+            pair = {"prediction_job": item["job_id"],
+                    "prediction_slot": output_slot, "task": task}
+            if config["experiment"]["setting"] == "transfer_baseline":
+                source_task = item["lineage"]["baseline_source_task"]
+                pair["baseline_source_task"] = source_task
+                reusable = reusable_evaluations.get(source_task + "--" + task)
+                if reusable is not None:
+                    pair["reused_evaluation"] = reusable
+            scoring_pairs.append(pair)
     return [_job(
         "eval-judge-all",
         tasks=TASKS,
@@ -267,7 +309,7 @@ def _eval_jobs(config):
         lineage={
             "judge_model": config["experiment"]["judge_model"],
             "scoring_pairs": scoring_pairs,
-            "judge_model_loads": 1,
+            "judge_model_loads": 1 if any(pair.get("reused_evaluation") is None for pair in scoring_pairs) else 0,
         },
         output={"artifact_kind": "metrics", "slot": "combined"},
     )]
@@ -280,7 +322,12 @@ def build_stage_plan(snapshot, stage):
     experiment = snapshot["config"]["experiment"]
     if stage not in experiment["enabled_stages"]:
         raise ConfigError("Stage is not enabled: {}".format(stage))
-    jobs = {"tune": _tune_jobs, "infer": _infer_jobs, "eval": _eval_jobs}[stage](snapshot["config"])
+    baseline_source = snapshot["layers"].get("transfer_baseline_source")
+    baseline_reuse = snapshot["layers"].get("transfer_baseline_reuse")
+    builders = {"tune": lambda config: _tune_jobs(config),
+                "infer": lambda config: _infer_jobs(config, baseline_source, baseline_reuse),
+                "eval": lambda config: _eval_jobs(config, baseline_source, baseline_reuse)}
+    jobs = builders[stage](snapshot["config"])
     configured_jobs = set(snapshot["config"][stage]["jobs"])
     planned_jobs = {item["job_id"] for item in jobs}
     unused = configured_jobs - planned_jobs
@@ -320,7 +367,15 @@ def build_plan(snapshot):
 def prepare_records(snapshot, experiment_id=None):
     """Materialize a configuration and its plans as records; launch no workloads."""
     validate_snapshot(snapshot)
-    source_context = validate_transfer_source(snapshot, experiment_id, audit_adapters=True)
+    if snapshot["config"]["experiment"]["setting"] == "transfer_baseline":
+        if __package__ in (None, ""):
+            from lib.transfer_baseline import bind_transfer_baseline_snapshot
+        else:
+            from .lib.transfer_baseline import bind_transfer_baseline_snapshot
+        snapshot = bind_transfer_baseline_snapshot(snapshot, experiment_id)
+        source_context = None
+    else:
+        source_context = validate_transfer_source(snapshot, experiment_id, audit_adapters=True)
     if source_context is not None:
         snapshot = make_snapshot(
             snapshot["config"], snapshot["sources"],
@@ -366,6 +421,12 @@ def main(argv=None):
     overrides = dotted_overrides(args.set) if args.set else {}
     snapshot = load_config(args.config, default_path=args.default_path, cli_overrides=overrides)
     if args.command == "plan":
+        if snapshot["config"]["experiment"]["setting"] == "transfer_baseline":
+            if __package__ in (None, ""):
+                from lib.transfer_baseline import bind_transfer_baseline_snapshot
+            else:
+                from .lib.transfer_baseline import bind_transfer_baseline_snapshot
+            snapshot = bind_transfer_baseline_snapshot(snapshot)
         print(json.dumps(build_plan(snapshot), ensure_ascii=False, indent=2, sort_keys=True))
         return 0
     try:
