@@ -9,7 +9,7 @@ import subprocess
 import time
 import traceback
 
-from .artifacts import check_manifest
+from .artifacts import ManifestVerificationCache, check_manifest
 from .common import fingerprint, read_json, utc_now, write_json_atomic
 from .config import resolve_job_config
 from .orchestration_logging import run_logged
@@ -182,14 +182,17 @@ def _bind_adapter_sources(jobs, current_experiment_id, source_experiment_id, tun
         info["adapter"] = adapter
 
 
-def _artifact_map(job_dir, job):
+def _artifact_map(job_dir, job, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     result = {}
     for item in job["artifacts"]:
         if item["role"] in result:
             raise ValueError("Duplicate registered artifact role: " + item["role"])
         if item["path"] != "artifacts/" + item["role"] + ".json":
             raise ValueError("Artifact manifest path differs from its role")
-        manifest = check_manifest(read_json(job_dir / item["path"]), verify_contents=True)
+        manifest = check_manifest(read_json(job_dir / item["path"]), verify_contents=True,
+                                  verification_cache=verification_cache)
         if (manifest["kind"] != item["kind"] or manifest["fingerprint"] != item["fingerprint"]
                 or manifest["producer"] != {key: job[key] for key in
                                                ("experiment_id", "stage", "run_id", "job_id")}):
@@ -198,7 +201,9 @@ def _artifact_map(job_dir, job):
     return result
 
 
-def _audit_succeeded_job(info, dataset_root):
+def _audit_succeeded_job(info, dataset_root, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     job_dir, job = info["directory"], info["record"]
     tasks = job["tasks"]
     expected_inputs = {spec["role"] for spec in job["input_specs"]}
@@ -207,7 +212,7 @@ def _audit_succeeded_job(info, dataset_root):
     if set(job["inputs"]) != expected_inputs:
         raise ValueError("Succeeded infer job input roles are incomplete: " + job["job_id"])
     for manifest in job["inputs"].values():
-        check_manifest(manifest, verify_contents=True)
+        check_manifest(manifest, verify_contents=True, verification_cache=verification_cache)
         if Path(manifest["requested_path"]).resolve(strict=True) != Path(manifest["path"]):
             raise ValueError("Succeeded infer input path was redirected: " + job["job_id"])
     for spec in job["input_specs"]:
@@ -256,7 +261,7 @@ def _audit_succeeded_job(info, dataset_root):
             or request.get("adapter_fingerprint") != (info["adapter"]["fingerprint"]
                                                        if info["adapter"] else None)):
         raise ValueError("Successful inference request does not match its frozen job: " + job["job_id"])
-    outputs = _artifact_map(job_dir, job)
+    outputs = _artifact_map(job_dir, job, verification_cache=verification_cache)
     expected_roles = {"prediction-" + task for task in tasks} | {"inference-summary"}
     if set(outputs) != expected_roles:
         raise ValueError("Successful infer job has an incomplete prediction artifact set: " + job["job_id"])
