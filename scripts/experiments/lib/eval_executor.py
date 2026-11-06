@@ -9,7 +9,7 @@ import signal
 import subprocess
 import time
 
-from .artifacts import check_manifest, make_manifest
+from .artifacts import ManifestVerificationCache, check_manifest, make_manifest
 from .common import TASKS, fingerprint, read_json, require_id, sha256_file, utc_now, write_json_atomic
 from .config import resolve_job_config
 from .eval_worker import inspect_evaluation, pair_id, prepare_pair
@@ -115,7 +115,8 @@ def _context(job_dir):
     return job, snapshot, experiment_dir, run
 
 
-def _prediction_source(manifest, pair, experiment_dir, experiment_config, cache):
+def _prediction_source(manifest, pair, experiment_dir, experiment_config, cache,
+                       verification_cache=None):
     producer = manifest["producer"]
     if (not isinstance(producer, dict) or producer["experiment_id"] != experiment_dir.name
             or producer["stage"] != "infer" or producer["job_id"] != pair["prediction_job"]):
@@ -163,7 +164,8 @@ def _prediction_source(manifest, pair, experiment_dir, experiment_config, cache)
         _audit_succeeded_job({"directory": source_dir, "record": source, "snapshot": source_snapshot,
                               "adapter": adapters[0] if adapters else None,
                               "resources": _resources(source_snapshot["config"], source["job_id"])},
-                             experiment_config["dataset_root"])
+                             experiment_config["dataset_root"],
+                             verification_cache=verification_cache)
         cache[key] = (source_dir, source, source_snapshot)
     source_dir, source, source_snapshot = cache[key]
     registered = [item for item in source["artifacts"] if item["kind"] == "prediction"
@@ -184,7 +186,9 @@ def _prediction_source(manifest, pair, experiment_dir, experiment_config, cache)
     return source, source_snapshot
 
 
-def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
+def _inputs(job_dir, job, snapshot, supplied, experiment_dir, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     experiment = snapshot["config"]["experiment"]
     specs = {spec["role"]: spec for spec in job["input_specs"]}
     expected = {"judge-model": ("judge_model", experiment["judge_model"], {}),
@@ -210,10 +214,11 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
         for role, spec in specs.items():
             if role not in inputs:
                 inputs[role] = make_manifest(spec["kind"], spec["path"],
-                                            source=spec["source"], metadata=spec["metadata"])
+                                            source=spec["source"], metadata=spec["metadata"],
+                                            verification_cache=verification_cache)
     for role, manifest in inputs.items():
         require_id(role)
-        check_manifest(manifest, verify_contents=True)
+        check_manifest(manifest, verify_contents=True, verification_cache=verification_cache)
         if role not in specs and manifest["kind"] != "prediction":
             raise ValueError("Unexpected eval input role: " + role)
         if Path(manifest["requested_path"]).resolve(strict=True) != Path(manifest["path"]):
@@ -242,7 +247,9 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
         if len(matches) != 1 or matches[0][0] in used:
             raise ValueError("A scoring pair has a missing, duplicate or ambiguous prediction")
         role, prediction = matches[0]
-        source, source_snapshot = _prediction_source(prediction, pair, experiment_dir, experiment, cache)
+        source, source_snapshot = _prediction_source(
+            prediction, pair, experiment_dir, experiment, cache,
+            verification_cache=verification_cache)
         annotation = inputs["annotation-{}-test".format(pair["task"])]
         if (source["inputs"].get("annotation-{}-test".format(pair["task"])) != annotation
                 or prediction["metadata"].get("annotation_fingerprint") != annotation["fingerprint"]):
@@ -287,9 +294,11 @@ def _make_request(job, config, inputs, pairs, output, group, identity):
     return {**payload, "request_fingerprint": fingerprint(payload)}
 
 
-def _register_outputs(job_dir, job, inputs, output, request):
+def _register_outputs(job_dir, job, inputs, output, request, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     for manifest in inputs.values():
-        check_manifest(manifest, verify_contents=True)
+        check_manifest(manifest, verify_contents=True, verification_cache=verification_cache)
         if Path(manifest["requested_path"]).resolve(strict=True) != Path(manifest["path"]):
             raise ValueError("An eval input path changed during judging")
     summary = inspect_evaluation(request)
@@ -309,14 +318,17 @@ def _register_outputs(job_dir, job, inputs, output, request):
                                    ("judge.metrics.json", "summary", "pair-metrics-")):
             role = require_id(prefix + pair["pair_id"])
             manifests.append((role, make_manifest(kind, Path(pair["output_dir"]) / name,
-                             producer=request["producer"], metadata=metadata)))
+                             producer=request["producer"], metadata=metadata,
+                             verification_cache=verification_cache)))
     combined = {**common, "slot": "combined", "tasks": job["tasks"],
                 "pair_order": summary["pair_order"], "sample_count": summary["total"],
                 "combined_flat_rawacc": summary["combined_flat_rawacc"]}
     manifests.append(("metrics", make_manifest("metrics", output / "judge.metrics.json",
-                     producer=request["producer"], metadata=combined)))
+                     producer=request["producer"], metadata=combined,
+                     verification_cache=verification_cache)))
     manifests.append(("evaluation-summary", make_manifest("summary", output / "evaluation_result.json",
-                     producer=request["producer"], metadata=combined)))
+                     producer=request["producer"], metadata=combined,
+                     verification_cache=verification_cache)))
     for role, manifest in manifests:
         register_artifact(job_dir, role, manifest)
     return {role: manifest["fingerprint"] for role, manifest in manifests}
@@ -374,7 +386,9 @@ def execute_eval_job(job_dir, *, gpu_group_index=0, input_manifests=None):
                 for physical in sorted(group):
                     stack.enter_context(_exclusive(Path("/tmp/qwen3vl-lora-tune-locks") /
                                         "physical-{}.lock".format(physical), blocking=True))
-                job, inputs, pairs = _inputs(job_dir, job, snapshot, input_manifests, experiment_dir)
+                input_verification_cache = ManifestVerificationCache()
+                job, inputs, pairs = _inputs(job_dir, job, snapshot, input_manifests, experiment_dir,
+                                             verification_cache=input_verification_cache)
                 protected_paths = [Path(value["path"]) for value in inputs.values()]
                 protected_paths.extend([
                     Path(config["experiment"]["dataset_root"]).resolve(strict=True),
@@ -420,7 +434,10 @@ def execute_eval_job(job_dir, *, gpu_group_index=0, input_manifests=None):
                 if execution["returncode"] != 0:
                     raise RuntimeError("Evaluation exited with code {}. See {}".format(
                         execution["returncode"], execution["log_path"]))
-                execution["artifacts"] = _register_outputs(job_dir, job, inputs, output, request)
+                # Use a fresh cache after judging so input changes during execution are detected.
+                execution["artifacts"] = _register_outputs(
+                    job_dir, job, inputs, output, request,
+                    verification_cache=ManifestVerificationCache())
                 execution.update(status="outputs_registered", finished_at=utc_now(),
                                  elapsed_seconds=time.monotonic() - started)
                 save_execution()

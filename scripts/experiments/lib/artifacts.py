@@ -10,6 +10,31 @@ ARTIFACT_KINDS = ("base_model", "judge_model", "processor", "adapter", "checkpoi
                   "prediction", "judge_raw", "judge_scored", "metrics", "summary")
 
 
+class ManifestVerificationCache:
+    """Reuse successful content hashes within one preparation or audit phase only."""
+
+    def __init__(self):
+        self._identities = {}
+        self._verified = set()
+
+    def identity_for(self, path):
+        resolved = Path(path).expanduser().resolve(strict=True)
+        key = str(resolved)
+        if key not in self._identities:
+            self._identities[key] = path_identity(resolved)
+        return deepcopy(self._identities[key])
+
+    def verify(self, path, expected_identity):
+        resolved = Path(path).expanduser().resolve(strict=True)
+        key = (str(resolved), fingerprint(expected_identity))
+        if key in self._verified:
+            return
+        actual = self.identity_for(resolved)
+        if actual != expected_identity:
+            raise ValueError("Artifact contents no longer match the manifest: {}".format(resolved))
+        self._verified.add(key)
+
+
 def _file_identity(path):
     before = path.stat()
     digest = sha256_file(path)
@@ -77,7 +102,7 @@ def _check_provenance(producer, source, metadata):
         raise ValueError("Artifact metadata must be a JSON object")
 
 
-def make_manifest(kind, path, *, producer=None, source=None, metadata=None):
+def make_manifest(kind, path, *, producer=None, source=None, metadata=None, verification_cache=None):
     """External inputs require a source description; produced artifacts identify their job."""
     if kind not in ARTIFACT_KINDS:
         raise ValueError("Unsupported artifact kind: {}".format(kind))
@@ -87,13 +112,15 @@ def make_manifest(kind, path, *, producer=None, source=None, metadata=None):
     requested = str(Path(path).expanduser().absolute())
     resolved = Path(path).expanduser().resolve(strict=True)
     _check_kind_path(kind, resolved)
+    identity = (verification_cache.identity_for(resolved) if verification_cache is not None
+                else path_identity(resolved))
     payload = {"schema_version": SCHEMA_VERSION, "kind": kind, "requested_path": requested,
-               "path": str(resolved), "identity": path_identity(resolved), "producer": producer,
+               "path": str(resolved), "identity": identity, "producer": producer,
                "external_source": source, "metadata": metadata}
     return {**payload, "fingerprint": fingerprint(payload)}
 
 
-def check_manifest(manifest, verify_contents=False):
+def check_manifest(manifest, verify_contents=False, verification_cache=None):
     fields = {"schema_version", "kind", "requested_path", "path", "identity", "producer",
               "external_source", "metadata", "fingerprint"}
     if (not isinstance(manifest, dict) or set(manifest) != fields
@@ -108,6 +135,11 @@ def check_manifest(manifest, verify_contents=False):
         raise ValueError("Artifact paths must be absolute")
     path = Path(manifest["path"])
     _check_kind_path(manifest["kind"], path)
-    if verify_contents and path_identity(path) != manifest["identity"]:
-        raise ValueError("Artifact contents no longer match the manifest: {}".format(path))
+    if verify_contents:
+        if verification_cache is None:
+            actual = path_identity(path)
+            if actual != manifest["identity"]:
+                raise ValueError("Artifact contents no longer match the manifest: {}".format(path))
+        else:
+            verification_cache.verify(path, manifest["identity"])
     return manifest

@@ -14,7 +14,7 @@ import tempfile
 import time
 import traceback
 
-from .artifacts import check_manifest, make_manifest
+from .artifacts import ManifestVerificationCache, check_manifest, make_manifest
 from .common import TASKS, fingerprint, read_json, require_id, sha256_file, utc_now, write_json_atomic
 from .config import resolve_job_config
 from .eval_executor import _inputs, _make_request, _planned_job, build_eval_command
@@ -123,6 +123,7 @@ def _bind_predictions(info, experiment_dir, experiment, experiment_snapshot):
     if pairs != expected_pairs:
         raise ValueError("Eval scoring pairs do not cover the exact successful infer plan in order")
     sources, predictions = {}, {}
+    verification_cache = ManifestVerificationCache()
     for pair in pairs:
         identifier = pair["prediction_job"]
         if identifier not in sources:
@@ -131,7 +132,8 @@ def _bind_predictions(info, experiment_dir, experiment, experiment_snapshot):
             if Path(job["output_dir"]) != Path(source_run["output_root"]) / identifier:
                 raise ValueError("Infer source output is outside its registered run")
             sources[identifier] = {"directory": directory, "record": job,
-                                   "artifacts": _artifact_map(directory, job)}
+                                   "artifacts": _artifact_map(
+                                       directory, job, verification_cache=verification_cache)}
         source = sources[identifier]
         role = require_id("prediction-" + pair_id(pair))
         artifact_role = "prediction-" + pair["task"]
@@ -141,11 +143,13 @@ def _bind_predictions(info, experiment_dir, experiment, experiment_snapshot):
         predictions[role] = {"manifest": manifest,
                              "manifest_path": str(source["directory"] / "artifacts" / (artifact_role + ".json"))}
     info.update(infer_run_id=source_run["run_id"], sources=sources, predictions=predictions)
-    _resolved_inputs(info, experiment_dir)
+    _resolved_inputs(info, experiment_dir, verification_cache=verification_cache)
 
 
-def _resolved_inputs(info, experiment_dir):
+def _resolved_inputs(info, experiment_dir, verification_cache=None):
     """Reuse bound-input inspection without binding or mutating the job record."""
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     job = info["record"]
     if job["status"] == "succeeded":
         inputs = deepcopy(job["inputs"])
@@ -158,17 +162,21 @@ def _resolved_inputs(info, experiment_dir):
         inputs = {role: deepcopy(value["manifest"]) for role, value in info["predictions"].items()}
         for spec in job["input_specs"]:
             inputs[spec["role"]] = make_manifest(spec["kind"], spec["path"],
-                                                 source=spec["source"], metadata=spec["metadata"])
+                                                 source=spec["source"], metadata=spec["metadata"],
+                                                 verification_cache=verification_cache)
     if not inputs:
         raise ValueError("Eval requires explicitly resolved inputs")
     # _inputs inspects an already-bound copy. Its bind_inputs branch is never
     # reached: no prospective inputs are written by the high-level process.
     candidate = {**job, "inputs": inputs}
-    _, inputs, pairs = _inputs(info["directory"], candidate, info["snapshot"], {}, experiment_dir)
+    _, inputs, pairs = _inputs(info["directory"], candidate, info["snapshot"], {}, experiment_dir,
+                               verification_cache=verification_cache)
     return inputs, pairs
 
 
-def _eval_artifacts(info):
+def _eval_artifacts(info, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     job, directory = info["record"], info["directory"]
     result = {}
     producer = {key: job[key] for key in ("experiment_id", "stage", "run_id", "job_id")}
@@ -176,7 +184,8 @@ def _eval_artifacts(info):
         role = require_id(item["role"])
         if role in result or item["path"] != "artifacts/" + role + ".json":
             raise ValueError("Duplicate or redirected eval artifact registration")
-        manifest = check_manifest(read_json(directory / item["path"]), verify_contents=True)
+        manifest = check_manifest(read_json(directory / item["path"]), verify_contents=True,
+                                  verification_cache=verification_cache)
         if (manifest["kind"] != item["kind"] or manifest["fingerprint"] != item["fingerprint"]
                 or manifest["producer"] != producer):
             raise ValueError("Eval artifact differs from its registered producer")
@@ -184,7 +193,9 @@ def _eval_artifacts(info):
     return result
 
 
-def _audit_succeeded_job(info, experiment_dir):
+def _audit_succeeded_job(info, experiment_dir, verification_cache=None):
+    if verification_cache is None:
+        verification_cache = ManifestVerificationCache()
     job, snapshot = load_job(info["directory"])
     if (job["status"] != "succeeded"
             or snapshot["snapshot_fingerprint"] != info["snapshot"]["snapshot_fingerprint"]
@@ -194,7 +205,7 @@ def _audit_succeeded_job(info, experiment_dir):
                     "training_state_policy", "resume_training_state"))):
         raise ValueError("Successful eval job identity or frozen configuration changed")
     info["record"] = job
-    inputs, pairs = _resolved_inputs(info, experiment_dir)
+    inputs, pairs = _resolved_inputs(info, experiment_dir, verification_cache=verification_cache)
     config = snapshot["config"]
     execution = read_json(info["directory"] / "execution.json")
     index = execution.get("gpu_group_index")
@@ -222,7 +233,7 @@ def _audit_succeeded_job(info, experiment_dir):
             or execution.get("cwd") != config["experiment"]["repo_root"]):
         raise ValueError("Successful eval request differs from its exact frozen inputs or receipt")
     summary = inspect_evaluation(request)
-    outputs = _eval_artifacts(info)
+    outputs = _eval_artifacts(info, verification_cache=verification_cache)
     common = {"config_fingerprint": job["config_fingerprint"], "lineage": job["lineage"],
               "request_fingerprint": request["request_fingerprint"], "input_fingerprints": request["input_fingerprints"],
               "params": request["params"], "judge_model_fingerprint": request["judge_model_fingerprint"],
