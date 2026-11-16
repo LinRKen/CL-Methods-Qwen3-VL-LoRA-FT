@@ -199,7 +199,6 @@ def _inputs(job_dir, job, snapshot, supplied, experiment_dir):
         if reference_source != expected_source:
             raise ValueError("Infer adapter source differs from its frozen lineage")
     if experiment["setting"] == "transfer_baseline":
-        from .tune_executor import _registered_producer
         for adapter in adapters:
             source_job = _registered_producer(adapter, experiment["records_root"])
             producer = adapter["producer"]
